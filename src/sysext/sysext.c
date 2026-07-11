@@ -28,6 +28,7 @@
 #include "devnum-util.h"
 #include "discover-image.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "env-util.h"
 #include "errno-util.h"
 #include "escape.h"
@@ -480,9 +481,13 @@ static int move_submounts(const char *src, const char *dst) {
                 if (child_fd < 0)
                         return log_error_errno(errno, "Failed to pin mountpoint %s: %m", t);
 
-                r = mount_follow_verbose(LOG_ERR, m->path, FORMAT_PROC_FD_PATH(child_fd), /* fstype= */ NULL, MS_BIND|MS_REC, /* options= */ NULL);
+                /* Instead of a bind mount we attach the detached clone produced by
+                 * open_tree_attr_with_fallback() from get_sub_mounts() because that has no propagation
+                 * relationship with the original anymore and the MNT_DETACH below won't propagate for
+                 * nested mounts. */
+                r = RET_NERRNO(move_mount(m->mount_fd, "", child_fd, "", MOVE_MOUNT_F_EMPTY_PATH|MOVE_MOUNT_T_EMPTY_PATH));
                 if (r < 0)
-                        return r;
+                        return log_error_errno(r, "Failed to move mount '%s' to '%s': %m", m->path, t);
 
                 (void) umount_verbose(LOG_WARNING, m->path, MNT_DETACH);
         }
@@ -1824,7 +1829,7 @@ static int unmerge(
         bool need_to_reload;
         int r;
 
-        (void) DLOPEN_LIBMOUNT(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_REQUIRED);
+        (void) DLOPEN_LIBMOUNT(LOG_DEBUG, required);
 
         r = get_extension_release_metadata(image_class, hierarchies, no_reload, &need_to_reload, &units_to_restart, &units_to_reload_or_restart);
         if (r < 0)
@@ -2409,9 +2414,9 @@ static int merge(ImageClass image_class,
 
         int r;
 
-        (void) DLOPEN_CRYPTSETUP(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
-        (void) DLOPEN_LIBBLKID(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_REQUIRED);
-        (void) DLOPEN_LIBMOUNT(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_REQUIRED);
+        (void) DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
+        (void) DLOPEN_LIBBLKID(LOG_DEBUG, required);
+        (void) DLOPEN_LIBMOUNT(LOG_DEBUG, required);
 
         _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
         r = pidref_safe_fork("(sd-merge)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_NEW_MOUNTNS, &pidref);
@@ -3170,6 +3175,9 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
 static int run(int argc, char *argv[]) {
         char **args = NULL;
         int r;
+
+        LIBCRYPTO_NOTE(suggested);
+        LIBSELINUX_NOTE(recommended);
 
         log_setup();
 

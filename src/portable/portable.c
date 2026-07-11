@@ -610,8 +610,8 @@ static int portable_extract_by_path(
                  * there, and extract the metadata we need. The metadata is sent from the child back to us. */
 
                 /* Load some libraries before we fork workers off that want to use them */
-                (void) DLOPEN_CRYPTSETUP(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
-                (void) DLOPEN_LIBMOUNT(LOG_DEBUG, SD_ELF_NOTE_DLOPEN_PRIORITY_REQUIRED);
+                (void) DLOPEN_CRYPTSETUP(LOG_DEBUG, recommended);
+                (void) DLOPEN_LIBMOUNT(LOG_DEBUG, required);
 
                 r = mkdtemp_malloc("/tmp/inspect-XXXXXX", &tmpdir);
                 if (r < 0)
@@ -2164,7 +2164,7 @@ int portable_attach(
         return 0;
 }
 
-static bool marker_matches_images(const char *marker, const char *name_or_path, char **extension_image_paths, bool match_all) {
+static int marker_matches_images(const char *marker, const char *name_or_path, char **extension_image_paths, bool match_all) {
         _cleanup_strv_free_ char **root_and_extensions = NULL;
         int r;
 
@@ -2190,7 +2190,7 @@ static bool marker_matches_images(const char *marker, const char *name_or_path, 
         /* Ensure the number of images passed matches the number of images listed in the marker */
         while (!isempty(marker))
                 STRV_FOREACH(image_name_or_path, root_and_extensions) {
-                        _cleanup_free_ char *image = NULL, *base_image = NULL, *base_image_name_or_path = NULL;
+                        _cleanup_free_ char *image = NULL, *base_image = NULL, *base_image_name_or_path = NULL, *base_picked_image = NULL;
                         _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
 
                         r = extract_first_word(&marker, &image, ":", EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE);
@@ -2211,19 +2211,21 @@ static bool marker_matches_images(const char *marker, const char *name_or_path, 
                                       ELEMENTSOF(pick_filter_image_any),
                                       PICK_ARCHITECTURE|PICK_TRIES|PICK_RESOLVE,
                                       &result);
-                        if (r < 0)
+                        if (r < 0 && r != -ENOENT)
                                 return r;
-                        if (!result.path)
-                                return log_debug_errno(
-                                                SYNTHETIC_ERRNO(ENOENT),
-                                                "No matching entry in .v/ directory %s found.",
-                                                *image_name_or_path);
 
-                        r = path_extract_image_name(result.path, &base_image_name_or_path);
+                        r = path_extract_image_name(*image_name_or_path, &base_image_name_or_path);
                         if (r < 0)
-                                return log_debug_errno(r, "Failed to extract image name from %s, ignoring: %m", result.path);
+                                return log_debug_errno(r, "Failed to extract image name from %s, ignoring: %m", *image_name_or_path);
 
-                        if (!streq(base_image, base_image_name_or_path)) {
+                        if (!streq(base_image, base_image_name_or_path) && result.path) {
+                                r = path_extract_image_name(result.path, &base_picked_image);
+                                if (r < 0)
+                                        return log_debug_errno(r, "Failed to extract image name from %s, ignoring: %m", result.path);
+                        }
+
+                        if (!streq(base_image, base_image_name_or_path) &&
+                            !streq_ptr(base_image, base_picked_image)) {
                                 if (match_all)
                                         return false;
                         } else if (!match_all)

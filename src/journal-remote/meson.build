@@ -44,7 +44,7 @@ executables += [
                 # We always build systemd-journal-remote regardless of ENABLE_REMOTE because we have to build
                 # fuzz-journal-remote even when --auto-features=disabled (see tools/oss-fuzz.sh for why).
                 # Instead, we make sure we don't install it when the remote feature is disabled.
-                'install' : conf.get('ENABLE_REMOTE') == 1,
+                'install' : conf.get('ENABLE_REMOTE') == 1 ? 'yes' : 'no',
                 'sources' : systemd_journal_remote_sources,
                 'export' : systemd_journal_remote_export_sources,
                 'dependencies' : common_deps + [libmicrohttpd_cflags],
@@ -95,9 +95,4 @@ endforeach
 if conf.get('ENABLE_REMOTE') == 1 and conf.get('HAVE_MICROHTTPD') == 1
         install_data('browse.html',
                      install_dir : pkgdatadir / 'gatewayd')
-
-        if get_option('create-log-dirs')
-                install_emptydir('/var/log/journal/remote',
-                                 install_mode : 'rwxr-xr-x')
-        endif
 endif

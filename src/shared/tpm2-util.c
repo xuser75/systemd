@@ -4,7 +4,6 @@
 #include <unistd.h>
 
 #include "sd-device.h"
-#include "sd-dlopen.h"
 
 #include "alloc-util.h"
 #include "ansi-color.h"
@@ -167,11 +166,12 @@ static DLSYM_PROTOTYPE(Tss2_MU_UINT32_Marshal) = NULL;
 
 static DLSYM_PROTOTYPE(Tss2_RC_Decode) = NULL;
 
+_dlopen_loader_
 static int dlopen_tpm2_esys(int log_level) {
         static void *libtss2_esys_dl = NULL;
         int r;
 
-        TPM2_ESYS_NOTE(SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED);
+        LIBTSS2_ESYS_NOTE(suggested);
 
         r = dlopen_many_sym_or_warn(
                         &libtss2_esys_dl, "libtss2-esys.so.0", log_level,
@@ -230,20 +230,22 @@ static int dlopen_tpm2_esys(int log_level) {
         return 0;
 }
 
+_dlopen_loader_
 static int dlopen_tpm2_rc(int log_level) {
         static void *libtss2_rc_dl = NULL;
 
-        TPM2_RC_NOTE(SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED);
+        LIBTSS2_RC_NOTE(suggested);
 
         return dlopen_many_sym_or_warn(
                         &libtss2_rc_dl, "libtss2-rc.so.0", log_level,
                         DLSYM_ARG(Tss2_RC_Decode));
 }
 
+_dlopen_loader_
 static int dlopen_tpm2_mu(int log_level) {
         static void *libtss2_mu_dl = NULL;
 
-        TPM2_MU_NOTE(SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED);
+        LIBTSS2_MU_NOTE(suggested);
 
         return dlopen_many_sym_or_warn(
                         &libtss2_mu_dl, "libtss2-mu.so.0", log_level,
@@ -269,13 +271,14 @@ static int dlopen_tpm2_mu(int log_level) {
                         DLSYM_ARG(Tss2_MU_UINT32_Marshal));
 }
 
+_dlopen_loader_
 static int dlopen_tpm2_tcti_device(int log_level) {
         static void *libtss2_tcti_device_dl = NULL;
 
         /* The "device" TCTI is the most relevant one, let's also load it explicitly on dlopen_tpm2(), even
          * if we don't resolve any symbols here. */
 
-        TPM2_TCTI_DEVICE_NOTE(SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED);
+        LIBTSS2_TCTI_DEVICE_NOTE(suggested);
 
         return dlopen_verbose(
                         &libtss2_tcti_device_dl,
@@ -3234,7 +3237,7 @@ int tpm2_load(
         if (rc == TPM2_RC_LOCKOUT)
                 return log_debug_errno(SYNTHETIC_ERRNO(ENOLCK),
                                        "TPM2 device is in dictionary attack lockout mode.");
-        if ((rc & ~(TPM2_RC_N_MASK|TPM2_RC_P)) == TPM2_RC_INTEGRITY) /* Return a recognizable error if this key does not belong to the local TPM */
+        if (TPM2_RC_IS_FOREIGN_KEY(rc))
                 return log_debug_errno(SYNTHETIC_ERRNO(EREMOTE),
                                        "Key invalid or does not belong to current TPM.");
         if (rc != TSS2_RC_SUCCESS)
@@ -3454,6 +3457,9 @@ static int tpm2_import(
                         seed,
                         symmetric ?: &(TPMT_SYM_DEF_OBJECT){ .algorithm = TPM2_ALG_NULL, },
                         ret_private);
+        if (TPM2_RC_IS_FOREIGN_KEY(rc))
+                return log_debug_errno(SYNTHETIC_ERRNO(EREMOTE),
+                                       "Key invalid or does not belong to current TPM.");
         if (rc != TSS2_RC_SUCCESS)
                 return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
                                        "Failed to import key into TPM: %s", sym_Tss2_RC_Decode(rc));
@@ -4241,7 +4247,7 @@ static int find_signature(
         /* First, find field by bank */
         b = sd_json_variant_by_key(v, k);
         if (!b)
-                return log_debug_errno(SYNTHETIC_ERRNO(ENXIO), "Signature lacks data for PCR bank '%s'.", k);
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOSTR), "Signature lacks data for PCR bank '%s'.", k);
 
         if (!sd_json_variant_is_array(b))
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Bank data is not a JSON array.");
@@ -4311,7 +4317,7 @@ static int find_signature(
                 return sd_json_variant_unbase64(sigj, ret_signature, ret_signature_size);
         }
 
-        return log_debug_errno(SYNTHETIC_ERRNO(ENXIO), "Couldn't find signature for this PCR bank, PCR index and public key.");
+        return log_debug_errno(SYNTHETIC_ERRNO(ENOSTR), "Couldn't find signature for this PCR bank, PCR index and public key.");
 #else /* HAVE_OPENSSL */
         return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "OpenSSL support is disabled.");
 #endif
@@ -4748,6 +4754,10 @@ int tpm2_policy_authorize_nv(
                                                                   * just put together */
                 return log_debug_errno(SYNTHETIC_ERRNO(EREMCHG),
                                        "Submitted policy does not match policy stored in PolicyAuthorizeNV.");
+        if ((rc & ~(TPM2_RC_N_MASK|TPM2_RC_P)) == TPM2_RC_HANDLE ||
+            rc == TPM2_RC_NV_UNINITIALIZED) /* NV index is missing, unwritten, or otherwise unusable for this policy (or: wrong authHandle/policySession). */
+                return log_debug_errno(SYNTHETIC_ERRNO(EADDRNOTAVAIL),
+                                       "NV index referenced by token is missing, unwritten, or unusable, it could be for another system.");
         if (rc != TSS2_RC_SUCCESS)
                 return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
                                        "Failed to add AuthorizeNV policy to TPM: %s",
@@ -6661,6 +6671,8 @@ int tpm2_unseal(Tpm2Context *c,
         /* Returns the following errors:
          *
          *   -EREMOTE         → blob is from a different TPM
+         *   -EADDRNOTAVAIL   → NV index referenced by policy is missing, unwritten, or unusable
+         *   -ENOSTR          → signature JSON has no matching entry for the current PCR policy
          *   -EDEADLK         → couldn't create primary key because authorization failure
          *   -ENOLCK          → TPM is in dictionary lockout mode
          *   -EREMCHG         → submitted policy doesn't match NV index stored policy (in case of PolicyAuthorizeNV)

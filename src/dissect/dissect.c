@@ -19,6 +19,7 @@
 #include "device-util.h"
 #include "discover-image.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "env-util.h"
 #include "errno-util.h"
 #include "escape.h"
@@ -493,7 +494,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 OPTION_LONG("make-archive", NULL, "Convert the DDI to an archive file"):
-                        r = DLOPEN_LIBARCHIVE(LOG_ERR, SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED);
+                        r = DLOPEN_LIBARCHIVE(LOG_ERR, recommended);
                         if (r < 0)
                                 return r;
 
@@ -1490,8 +1491,12 @@ static int action_list_or_mtree_or_copy_or_make_archive(DissectedImage *m, LoopD
 
                         /* We are looking at a directory. */
 
-                        target_fd = openat(dfd, bn, O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+                        target_fd = openat(dfd, bn, O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
                         if (target_fd < 0) {
+                                if (errno == ELOOP)
+                                        return log_error_errno(SYNTHETIC_ERRNO(ELOOP),
+                                                        "Refusing to copy directory to symlink destination '%s'.", arg_target);
+
                                 if (errno != ENOENT)
                                         return log_error_errno(errno, "Failed to open destination '%s': %m", arg_target);
 
@@ -1963,6 +1968,13 @@ static int run(int argc, char *argv[]) {
         _cleanup_(loop_device_unrefp) LoopDevice *d = NULL;
         _cleanup_close_ int userns_fd = -EBADF;
         int r;
+
+        LIBACL_NOTE(recommended);
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
 
         log_setup();
 

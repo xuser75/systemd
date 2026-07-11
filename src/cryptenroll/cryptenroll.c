@@ -21,6 +21,7 @@
 #include "cryptenroll-varlink.h"
 #include "cryptenroll-wipe.h"
 #include "cryptsetup-util.h"
+#include "dlopen-note.h"
 #include "extract-word.h"
 #include "format-table.h"
 #include "help-util.h"
@@ -802,7 +803,7 @@ static int check_for_homed(struct crypt_device *cd) {
 
         for (int token = 0; token < sym_crypt_token_max(CRYPT_LUKS2); token++) {
                 r = cryptsetup_get_token_as_json(cd, token, "systemd-homed", NULL);
-                if (IN_SET(r, -ENOENT, -EINVAL, -EMEDIUMTYPE))
+                if (ERRNO_IS_NEG_CRYPTSETUP_TOKEN_SKIP(r))
                         continue;
                 if (r < 0)
                         return log_error_errno(r, "Failed to read JSON token data off disk: %m");
@@ -1019,6 +1020,13 @@ static int run(int argc, char *argv[]) {
         _cleanup_(enroll_context_done) EnrollContext c = ENROLL_CONTEXT_NULL;
         int slot, r;
 
+        LIBCRYPTO_NOTE(suggested);
+        LIBFIDO2_NOTE(suggested);
+        LIBP11KIT_NOTE(suggested);
+        LIBQRENCODE_NOTE(suggested);
+        PASSWORD_NOTE(suggested);
+        TPM2_NOTE(suggested);
+
         log_setup();
 
         /* A delicious drop of snake oil */
@@ -1036,7 +1044,7 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        r = DLOPEN_CRYPTSETUP(LOG_ERR, SD_ELF_NOTE_DLOPEN_PRIORITY_REQUIRED);
+        r = DLOPEN_CRYPTSETUP(LOG_ERR, required);
         if (r < 0)
                 return r;
 

@@ -10,9 +10,12 @@
 #include "build.h"
 #include "bus-polkit.h"
 #include "conf-files.h"
+#include "conf-parser.h"
 #include "constants.h"
 #include "discover-image.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
+#include "dropin.h"
 #include "env-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
@@ -31,6 +34,7 @@
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
+#include "path-util.h"
 #include "pretty-print.h"
 #include "runtime-scope.h"
 #include "sort-util.h"
@@ -38,6 +42,7 @@
 #include "strv.h"
 #include "sysupdate.h"
 #include "sysupdate-cleanup.h"
+#include "sysupdate-config.h"
 #include "sysupdate-feature.h"
 #include "sysupdate-instance.h"
 #include "sysupdate-target.h"
@@ -75,6 +80,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_transfer_source, freep);
 
 #define CONTEXT_NULL                                              \
         (Context) {                                               \
+                .component_enabled = true,                        \
                 .sync = true,                                     \
                 .instances_max = UINT64_MAX,                      \
                 .verify = -1,                                     \
@@ -114,6 +120,8 @@ void context_done(Context *c) {
         c->root = mfree(c->root);
         c->image = mfree(c->image);
         c->component = mfree(c->component);
+        c->component_description = mfree(c->component_description);
+        c->component_documentation = strv_free(c->component_documentation);
         c->image_policy = image_policy_free(c->image_policy);
         c->transfer_source = mfree(c->transfer_source);
 
@@ -153,6 +161,50 @@ static int context_from_cmdline(Context *ret) {
                 if (!context.image_policy)
                         return log_oom();
         }
+
+        *ret = TAKE_GENERIC(context, Context, CONTEXT_NULL);
+        return 0;
+}
+
+static int context_from_base_with_component(const Context *base, const char *component, Context *ret) {
+        assert(base);
+        assert(component);
+        assert(ret);
+
+        /* Copies the specified context, but changes the component to the specified one */
+
+        _cleanup_(context_done) Context context = CONTEXT_NULL;
+
+        context.instances_max = base->instances_max;
+        context.sync = base->sync;
+        context.reboot = base->reboot;
+        context.verify = base->verify;
+        context.offline = base->offline;
+        context.cleanup = base->cleanup;
+
+        if (strdup_to(&context.root, base->root) < 0)
+                return log_oom();
+
+        if (strdup_to(&context.image, base->image) < 0)
+                return log_oom();
+
+        if (strdup_to(&context.transfer_source, base->transfer_source) < 0)
+                return log_oom();
+
+        if (base->image_policy) {
+                context.image_policy = image_policy_copy(base->image_policy);
+                if (!context.image_policy)
+                        return log_oom();
+        }
+
+        if (strdup_to(&context.component, component) < 0)
+                return log_oom();
+
+        /* NB: we do not copy .loop_device/.mounted_dir here, since that's for lifetime tracking only, and
+         * not needed for access (we only need to copy .root/.image) for that. Under the assumption that the
+         * contexts initialized via context_from_base_with_component() have a shorter lifetime than the
+         * contexts they are copied from we don't bother with lifetime tracking of the loopback device/mount
+         * point here. */
 
         *ret = TAKE_GENERIC(context, Context, CONTEXT_NULL);
         return 0;
@@ -280,9 +332,46 @@ static int read_transfers(
         return 0;
 }
 
+static int read_component(Context *c) {
+        int r;
+
+        assert(c);
+
+        /* Read a component description file, but only if we actually operate on a component */
+        if (c->definitions || !c->component)
+                return 0;
+
+        _cleanup_free_ char *j = strjoin("sysupdate.", c->component, ".component");
+        if (!j)
+                return log_oom();
+
+        ConfigTableItem table[] = {
+                { "Component", "Description",   config_parse_string,              0, &c->component_description   },
+                { "Component", "Documentation", config_parse_url_specifiers_many, 0, &c->component_documentation },
+                { "Component", "Enabled",       config_parse_bool,                0, &c->component_enabled       },
+                {}
+        };
+
+        r = config_parse_standard_file_with_dropins_full(
+                        c->root,
+                        /* root_fd= */ -EBADF,
+                        j,
+                        "Component\0",
+                        config_item_table_lookup, table,
+                        CONFIG_PARSE_WARN,
+                        /* userdata= */ (void *) c->root,
+                        /* ret_stats_by_path= */ NULL,
+                        /* ret_dropin_files= */ NULL);
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
 typedef enum ReadDefinitionsFlags {
-        READ_DEFINITIONS_REQUIRES_ENABLED_TRANSFERS = 1 << 0,
-        READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS     = 1 << 1,
+        READ_DEFINITIONS_REQUIRES_ENABLED_TRANSFERS = 1 << 0, /* fail unless there's at least one enabled transfer */
+        READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS     = 1 << 1, /* fail unless there's at least one transfer */
+        READ_DEFINITIONS_REQUIRES_ENABLED_COMPONENT = 1 << 2, /* fail if component is disabled */
 } ReadDefinitionsFlags;
 
 static int context_read_definitions(Context *c, const char* node, ReadDefinitionsFlags flags) {
@@ -315,6 +404,10 @@ static int context_read_definitions(Context *c, const char* node, ReadDefinition
         if (!dirs)
                 return log_oom();
 
+        r = read_component(c);
+        if (r < 0)
+                return r;
+
         r = read_features(c, (const char**) dirs);
         if (r < 0)
                 return r;
@@ -343,6 +436,9 @@ static int context_read_definitions(Context *c, const char* node, ReadDefinition
                 return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
                                        "No transfer definitions found.");
         }
+
+        if (FLAGS_SET(flags, READ_DEFINITIONS_REQUIRES_ENABLED_COMPONENT) && !c->component_enabled)
+                return log_error_errno(SYNTHETIC_ERRNO(EHOSTDOWN), "Component is disabled.");
 
         return 0;
 }
@@ -1029,10 +1125,9 @@ static int context_process_image(
 
         assert(c);
 
-        if (!c->image)
+        if (c->root || !c->image) /* Idempotent or nothing to do */
                 return 0;
 
-        assert(!c->root);
         assert(!c->mounted_dir);
         assert(!c->loop_device);
 
@@ -1094,7 +1189,9 @@ static int context_load_offline(
 
 static int context_load_online(
                 Context *context,
-                ProcessImageFlags process_image_flags) {
+                ProcessImageFlags process_image_flags,
+                ReadDefinitionsFlags read_definitions_flags) {
+
         int r;
 
         assert(context);
@@ -1105,7 +1202,7 @@ static int context_load_online(
         r = context_load_offline(
                         context,
                         process_image_flags,
-                        READ_DEFINITIONS_REQUIRES_ENABLED_TRANSFERS|READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS);
+                        read_definitions_flags);
         if (r < 0)
                 return r;
 
@@ -1156,7 +1253,10 @@ static int context_load_paths_from_image(Context *context, Image *image) {
  * syntactically validated by dispatch_target_identifier(), but might still point to components which don’t
  * exist, images which the user isn’t privileged to access, etc. This function validates the TargetIdentifier
  * against an enumerated list of known targets, which are safe to update without additional permissions. */
-static int context_load_online_from_target(Context *context, ProcessImageFlags process_image_flags) {
+static int context_load_online_from_target(
+                Context *context,
+                ProcessImageFlags process_image_flags,
+                ReadDefinitionsFlags read_definitions_flags) {
         int r;
 
         assert(context);
@@ -1247,7 +1347,7 @@ static int context_load_online_from_target(Context *context, ProcessImageFlags p
                 assert_not_reached();
         }
 
-        return context_load_online(context, process_image_flags);
+        return context_load_online(context, process_image_flags, read_definitions_flags);
 }
 
 static int context_on_acquire_progress(const Transfer *t, const Instance *inst, unsigned percentage) {
@@ -1650,7 +1750,11 @@ static int verb_list(int argc, char *argv[], uintptr_t _data, void *userdata) {
         if (context.component_all)
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "--component-all currently not supported for '%s'.", argv[0]);
 
-        r = context_load_online(&context, PROCESS_IMAGE_READ_ONLY);
+        r = context_load_online(
+                        &context,
+                        PROCESS_IMAGE_READ_ONLY,
+                        READ_DEFINITIONS_REQUIRES_ENABLED_TRANSFERS|
+                        READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS);
         if (r < 0)
                 return r;
 
@@ -1843,6 +1947,93 @@ static int verb_features(int argc, char *argv[], uintptr_t _data, void *userdata
         return 0;
 }
 
+static int make_dropin_dir(Context *c, char **ret) {
+        _cleanup_free_ char *dir = NULL;
+
+        assert(c);
+        assert(ret);
+
+        /* Returns the (writable) directory where feature definitions live, so that we can drop our
+         * 'Enabled=' override right next to them. This mirrors the directory logic in
+         * context_read_definitions(), but settles on a single writable location below /etc. */
+
+        if (c->definitions)
+                dir = strdup(c->definitions); /* --root= is not supported for this for now */
+        else if (c->component) {
+                _cleanup_free_ char *n = strjoin("sysupdate.", c->component, ".d");
+                if (!n)
+                        return log_oom();
+
+                dir = path_join(c->root, SYSCONF_DIR, n);
+        } else
+                dir = path_join(c->root, SYSCONF_DIR "/sysupdate.d");
+        if (!dir)
+                return log_oom();
+
+        *ret = TAKE_PTR(dir);
+        return 0;
+}
+
+VERB(verb_enable_feature, "enable-feature", "FEATURE…", 2, VERB_ANY, 0,
+     "Enable optional feature");
+VERB(verb_enable_feature, "disable-feature", "FEATURE…", 2, VERB_ANY, 0,
+     "Disable optional feature");
+static int verb_enable_feature(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        bool enable = streq(argv[0], "enable-feature");
+        int r;
+
+        _cleanup_(context_done) Context context = CONTEXT_NULL;
+        r = context_from_cmdline(&context);
+        if (r < 0)
+                return r;
+
+        if (context.component_all)
+                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "--component-all currently not supported for '%s'.", argv[0]);
+
+        r = context_load_offline(
+                        &context,
+                        /* process_image_flags= */ 0,
+                        /* read_definitions_flags= */ 0);
+        if (r < 0)
+                return r;
+
+        _cleanup_free_ char *dropin_dir = NULL;
+        r = make_dropin_dir(&context, &dropin_dir);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(name, strv_skip(argv, 1)) {
+
+                if (!feature_name_valid(*name))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Feature name invalid: %s", *name);
+
+                if (!hashmap_contains(context.features, *name))
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOENT),
+                                               "Optional feature not found: %s", *name);
+
+                _cleanup_free_ char *fname = strjoin(*name, ".feature");
+                if (!fname)
+                        return log_oom();
+
+                /* We assume that no sysadmin will name their config 50-systemd-sysupdate-enabled.conf */
+                r = write_drop_in_format(
+                                dropin_dir,
+                                fname,
+                                50, "systemd-sysupdate-enabled",
+                                "# Generated via 'systemd-sysupdate %s'\n\n"
+                                "[Feature]\n"
+                                "Enabled=%s\n",
+                                argv[0],
+                                yes_no(enable));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to write drop-in for feature '%s': %m", *name);
+
+                log_info("Feature '%s' %s.", *name, enable ? "enabled" : "disabled");
+        }
+
+        return 0;
+}
+
 VERB_NOARG(verb_check_new, "check-new",
            "Check if there's a new version available");
 static int verb_check_new(int argc, char *argv[], uintptr_t _data, void *userdata) {
@@ -1860,7 +2051,9 @@ static int verb_check_new(int argc, char *argv[], uintptr_t _data, void *userdat
 
         r = context_load_online(
                         &context,
-                        PROCESS_IMAGE_READ_ONLY);
+                        PROCESS_IMAGE_READ_ONLY,
+                        READ_DEFINITIONS_REQUIRES_ENABLED_TRANSFERS|
+                        READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS);
         if (r < 0)
                 return r;
 
@@ -1919,7 +2112,11 @@ static int vl_method_check_new(sd_varlink *link, sd_json_variant *parameters, sd
         /* CheckNew is always online */
         context.offline = false;
 
-        r = context_load_online_from_target(&context, PROCESS_IMAGE_READ_ONLY);
+        r = context_load_online_from_target(
+                        &context,
+                        PROCESS_IMAGE_READ_ONLY,
+                        READ_DEFINITIONS_REQUIRES_ENABLED_TRANSFERS|
+                        READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS);
         if (r == -ENOENT)
                 return sd_varlink_error(link, "io.systemd.SysUpdate.NoSuchTarget", NULL);
         if (r < 0)
@@ -1976,7 +2173,10 @@ static int verb_update_impl(int argc, char **argv, UpdateActionFlags action_flag
 
         r = context_load_online(
                         &context,
-                        /* process_image_flags= */ 0);
+                        /* process_image_flags= */ 0,
+                        READ_DEFINITIONS_REQUIRES_ENABLED_TRANSFERS|
+                        READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS|
+                        READ_DEFINITIONS_REQUIRES_ENABLED_COMPONENT);
         if (r < 0) {
                 if (r != -ENOENT)
                         return r;
@@ -2082,6 +2282,63 @@ static int verb_vacuum(int argc, char *argv[], uintptr_t _data, void *userdata) 
         return context_vacuum(&context, 0, NULL);
 }
 
+VERB_NOARG(verb_cleanup, "cleanup", "Clean up orphaned files");
+static int verb_cleanup(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(context_done) Context context = CONTEXT_NULL;
+        int r;
+
+        assert(argc <= 1);
+
+        r = context_from_cmdline(&context);
+        if (r < 0)
+                return r;
+
+        if (context.cleanup == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invocation of 'cleanup' with --cleanup=no is contradictory, refusing.");
+
+        r = context_load_offline(
+                        &context,
+                        /* process_image_flags= */ 0,
+                        /* read_definitions_flags= */ 0);
+        if (r < 0)
+                return r;
+
+        int ret = 0;
+        RET_GATHER(ret, installdb_cleanup_component(&context));
+
+        if (context.component_all) {
+                _cleanup_strv_free_ char **z = NULL;
+                r = installdb_list_components(&context, &z);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to enumerate components: %m");
+
+                STRV_FOREACH(i, z) {
+                        _cleanup_(context_done) Context component_context = CONTEXT_NULL;
+
+                        r = context_from_cmdline(&component_context);
+                        if (r < 0)
+                                return r;
+
+                        /* Override the component with our iter. This needs to be done in a fresh Context
+                         * as the installdb_fd and other state are specific to the component. */
+                        r = free_and_strdup_warn(&component_context.component, *i);
+                        if (r < 0)
+                                return r;
+
+                        r = context_load_offline(
+                                        &component_context,
+                                        /* process_image_flags= */ 0,
+                                        /* read_definitions_flags= */ 0);
+                        if (r < 0)
+                                return r;
+
+                        RET_GATHER(ret, installdb_cleanup_component(&component_context));
+                }
+        }
+
+        return ret;
+}
+
 VERB(verb_pending_or_reboot, "pending", NULL, 1, 1, 0,
      "Report whether a newer version is installed than currently booted");
 VERB(verb_pending_or_reboot, "reboot", NULL, 1, 1, 0,
@@ -2108,7 +2365,9 @@ static int verb_pending_or_reboot(int argc, char *argv[], uintptr_t _data, void 
         r = context_load_offline(
                         &context,
                         /* process_image_flags= */ 0,
-                        READ_DEFINITIONS_REQUIRES_ENABLED_TRANSFERS|READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS);
+                        READ_DEFINITIONS_REQUIRES_ENABLED_TRANSFERS|
+                        READ_DEFINITIONS_REQUIRES_ANY_TRANSFERS|
+                        READ_DEFINITIONS_REQUIRES_ENABLED_COMPONENT);
         if (r < 0)
                 return r;
 
@@ -2210,12 +2469,58 @@ static int verb_components(int argc, char *argv[], uintptr_t _data, void *userda
                         return 0;
                 }
 
-                if (has_default_component)
-                        printf("%s<default>%s\n",
-                               ansi_highlight(), ansi_normal());
+                _cleanup_(table_unrefp) Table *t = table_new("", "component", "description", "documentation");
+                if (!t)
+                        return log_oom();
 
-                STRV_FOREACH(i, component_names)
-                        puts(*i);
+                table_set_ersatz_string(t, TABLE_ERSATZ_DASH);
+
+                if (has_default_component) {
+                        r = table_add_many(
+                                        t,
+                                        TABLE_EMPTY,
+                                        TABLE_STRING, "<default>",
+                                        TABLE_SET_COLOR, ansi_highlight(),
+                                        TABLE_STRING, "Default Component",
+                                        TABLE_EMPTY);
+                        if (r < 0)
+                                return table_log_add_error(r);
+                }
+
+                STRV_FOREACH(i, component_names) {
+                        _cleanup_(context_done) Context cc = CONTEXT_NULL;
+
+                        r = context_from_base_with_component(
+                                        &context,
+                                        *i,
+                                        &cc);
+                        if (r < 0)
+                                return r;
+
+                        r = context_load_offline(
+                                        &cc,
+                                        /* process_image_flags= */ 0,
+                                        /* read_definitions_flags= */ 0);
+                        if (r == -ENOMEM)
+                                return r;
+                        if (r < 0)
+                                continue;
+
+                        const char *doc = cc.component_documentation ? cc.component_documentation[0] : NULL;
+
+                        r = table_add_many(
+                                        t,
+                                        TABLE_BOOLEAN_CHECKMARK, cc.component_enabled,
+                                        TABLE_SET_COLOR, ansi_highlight_green_red(cc.component_enabled),
+                                        TABLE_STRING, *i,
+                                        TABLE_STRING, cc.component_description,
+                                        TABLE_STRING, doc,
+                                        TABLE_SET_URL, doc);
+                        if (r < 0)
+                                return table_log_add_error(r);
+                }
+
+                return table_print_with_pager(t, arg_json_format_flags, arg_pager_flags, arg_legend);
         } else {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL;
 
@@ -2232,19 +2537,27 @@ static int verb_components(int argc, char *argv[], uintptr_t _data, void *userda
         return 0;
 }
 
-VERB_NOARG(verb_cleanup, "cleanup", "Clean up orphaned files");
-static int verb_cleanup(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        _cleanup_(context_done) Context context = CONTEXT_NULL;
+VERB(verb_enable_component, "enable-component", "COMPONENT…", 2, VERB_ANY, 0,
+     "Enable component");
+VERB(verb_enable_component, "disable-component", "COMPONENT…", 2, VERB_ANY, 0,
+     "Disable component");
+static int verb_enable_component(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        bool enable = streq(argv[0], "enable-component");
         int r;
 
-        assert(argc <= 1);
-
+        _cleanup_(context_done) Context context = CONTEXT_NULL;
         r = context_from_cmdline(&context);
         if (r < 0)
                 return r;
 
-        if (context.cleanup == 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invocation of 'cleanup' with --cleanup=no is contradictory, refusing.");
+        if (context.component || context.component_all)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "The --component= and --component-all switches may not be combined with '%s', "
+                                       "specify the component(s) as arguments instead.", argv[0]);
+
+        if (context.definitions)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "The --definitions= switch may not be combined with '%s'.", argv[0]);
 
         r = context_load_offline(
                         &context,
@@ -2253,40 +2566,45 @@ static int verb_cleanup(int argc, char *argv[], uintptr_t _data, void *userdata)
         if (r < 0)
                 return r;
 
-        int ret = 0;
-        RET_GATHER(ret, installdb_cleanup_component(&context));
+        _cleanup_strv_free_ char **component_names = NULL;
+        r = context_list_components(&context, &component_names, /* ret_has_default_component= */ NULL);
+        if (r < 0)
+                return r;
 
-        if (context.component_all) {
-                _cleanup_strv_free_ char **z = NULL;
-                r = installdb_list_components(&context, &z);
+        /* Component definition files live directly below the configuration directories, hence the drop-in
+         * goes right next to them below /etc. */
+        _cleanup_free_ char *dropin_dir = path_join(context.root, SYSCONF_DIR);
+        if (!dropin_dir)
+                return log_oom();
+
+        STRV_FOREACH(name, strv_skip(argv, 1)) {
+                if (!component_name_valid(*name))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Component name invalid: %s", *name);
+
+                if (!strv_contains(component_names, *name))
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOENT), "Component not found: %s", *name);
+
+                _cleanup_free_ char *fname = strjoin("sysupdate.", *name, ".component");
+                if (!fname)
+                        return log_oom();
+
+                /* We assume that no sysadmin will name their config 50-systemd-sysupdate-enabled.conf */
+                r = write_drop_in_format(
+                                dropin_dir,
+                                fname,
+                                50, "systemd-sysupdate-enabled",
+                                "# Generated via 'systemd-sysupdate %s'\n\n"
+                                "[Component]\n"
+                                "Enabled=%s\n",
+                                argv[0],
+                                yes_no(enable));
                 if (r < 0)
-                        return log_error_errno(r, "Failed to enumerate components: %m");
+                        return log_error_errno(r, "Failed to write drop-in for component '%s': %m", *name);
 
-                STRV_FOREACH(i, z) {
-                        _cleanup_(context_done) Context component_context = CONTEXT_NULL;
-
-                        r = context_from_cmdline(&component_context);
-                        if (r < 0)
-                                return r;
-
-                        /* Override the component with our iter. This needs to be done in a fresh Context
-                         * as the installdb_fd and other state are specific to the component. */
-                        r = free_and_strdup_warn(&component_context.component, *i);
-                        if (r < 0)
-                                return r;
-
-                        r = context_load_offline(
-                                        &component_context,
-                                        /* process_image_flags= */ 0,
-                                        /* read_definitions_flags= */ 0);
-                        if (r < 0)
-                                return r;
-
-                        RET_GATHER(ret, installdb_cleanup_component(&component_context));
-                }
+                log_info("Component '%s' %s.", *name, enable ? "enabled" : "disabled");
         }
 
-        return ret;
+        return 0;
 }
 
 static int help(void) {
@@ -2477,8 +2795,13 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         if (arg_image && arg_root)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Please specify either --root= or --image=, the combination of both is not supported.");
 
-        if ((arg_image || arg_root) && arg_reboot)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The --reboot switch may not be combined with --root= or --image=.");
+        if (arg_image || arg_root) {
+                if (arg_reboot)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The --reboot switch may not be combined with --root= or --image=.");
+
+                if (arg_definitions)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The --definitions= switch may not be combined with --root= or --image=.");
+        }
 
         if (arg_reboot && arg_component)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The --reboot switch may not be combined with --component=, as automatic reboots only apply to the booted OS version.");
@@ -2526,6 +2849,11 @@ static int vl_server(void) {
 
 static int run(int argc, char *argv[]) {
         int r;
+
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
 
         log_setup();
 
