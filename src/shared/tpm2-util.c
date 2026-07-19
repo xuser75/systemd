@@ -30,6 +30,7 @@
 #include "initrd-util.h"
 #include "io-util.h"
 #include "json-util.h"
+#include "limits-util.h"
 #include "log.h"
 #include "logarithm.h"
 #include "memory-util.h"
@@ -7777,8 +7778,9 @@ static int tpm2_userspace_log_dirty(int fd) {
 
         /* We set the sticky bit when we are about to append to the log file. We'll unset it afterwards
          * again. If we manage to take a lock on a file that has it set we know we didn't write it fully and
-         * it is corrupted. Ideally we'd like to use user xattrs for this, but unfortunately tmpfs (which is
-         * our assumed backend fs) doesn't know user xattrs. */
+         * it is corrupted. We return -ESTALE then; callers shall not reset the marker when they are done,
+         * so that the incompleteness remains detectable. Ideally we'd like to use user xattrs for this, but
+         * unfortunately tmpfs (which is our assumed backend fs) doesn't know user xattrs. */
 
         if (fstat(fd, &st) < 0)
                 return log_debug_errno(errno, "Failed to fstat TPM log file, ignoring: %m");
@@ -7792,7 +7794,7 @@ static int tpm2_userspace_log_dirty(int fd) {
         return 0;
 }
 
-static int tpm2_userspace_log_clean(int fd) {
+static int tpm2_userspace_log_clean(int fd, bool reset_marker) {
         int r;
 
         if (fd < 0) /* Apparently tpm2_local_log_open() failed earlier, let's not complain again */
@@ -7800,6 +7802,12 @@ static int tpm2_userspace_log_clean(int fd) {
 
         if (fsync(fd) < 0)
                 return log_debug_errno(errno, "Failed to sync JSON data: %m");
+
+        /* If the dirty marker was already set when we acquired the log, an earlier writer died before
+         * writing its record, i.e. the log is missing a record. Keep the marker then, so that the
+         * incompleteness remains detectable. */
+        if (!reset_marker)
+                return 0;
 
         /* Unset S_ISVTX again */
         if (fchmod(fd, 0600) < 0)
@@ -7819,7 +7827,8 @@ static int tpm2_userspace_log(
                 const char *nv_index_name,
                 const TPML_DIGEST_VALUES *values,
                 Tpm2UserspaceEventType event_type,
-                const char *description) {
+                const char *description,
+                bool reset_marker) {
 
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL, *array = NULL;
         _cleanup_free_ char *f = NULL;
@@ -7908,7 +7917,7 @@ static int tpm2_userspace_log(
         if (r < 0)
                 return log_debug_errno(r, "Failed to write JSON data to log: %m");
 
-        r = tpm2_userspace_log_clean(fd);
+        r = tpm2_userspace_log_clean(fd, reset_marker);
         if (r < 0)
                 return r;
 
@@ -7985,7 +7994,7 @@ int tpm2_pcr_extend_bytes(
          * and our measurement and change either */
         log_fd = tpm2_userspace_log_open();
 
-        (void) tpm2_userspace_log_dirty(log_fd);
+        bool reset_marker = tpm2_userspace_log_dirty(log_fd) >= 0;
         rc = sym_Esys_PCR_Extend(
                         c->esys_context,
                         ESYS_TR_PCR0 + pcr_index,
@@ -8008,7 +8017,8 @@ int tpm2_pcr_extend_bytes(
                         /* nv_index_name= */ NULL,
                         &values,
                         event_type,
-                        description);
+                        description,
+                        reset_marker);
 
         return 0;
 #else /* HAVE_OPENSSL */
@@ -8098,7 +8108,7 @@ int tpm2_nvpcr_get_index(const char *name, uint32_t *ret_nv_index, uint64_t *ret
         return 0;
 }
 
-int tpm2_nvpcr_extend_bytes(
+static int nvpcr_extend_bytes(
                 Tpm2Context *c,
                 const Tpm2Handle *session,
                 const char *name,
@@ -8178,7 +8188,7 @@ int tpm2_nvpcr_extend_bytes(
 
         log_debug("Successfully acquired handle to existing NV index 0x%" PRIx32 ".", p.nv_index);
 
-        (void) tpm2_userspace_log_dirty(log_fd);
+        bool reset_marker = tpm2_userspace_log_dirty(log_fd) >= 0;
 
         r = tpm2_extend_nvpcr_nv_index(
                         c,
@@ -8202,12 +8212,44 @@ int tpm2_nvpcr_extend_bytes(
                         name,
                         &digest_values,
                         event_type,
-                        description);
+                        description,
+                        reset_marker);
 
         return 0;
 #else /* HAVE_OPENSSL */
         return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "OpenSSL support is disabled.");
 #endif
+}
+
+int tpm2_nvpcr_extend_bytes(
+                Tpm2Context *c,
+                const Tpm2Handle *session,
+                const char *name,
+                const struct iovec *data,
+                const struct iovec *secret,
+                bool sync_secondary_anchor,
+                Tpm2UserspaceEventType event_type,
+                const char *description) {
+
+        int r;
+
+        r = nvpcr_extend_bytes(c, session, name, data, secret, event_type, description);
+        if (r != -ENETDOWN)
+                return r;
+
+        /* The NvPCR isn't anchored yet, i.e. systemd-tpm2-setup hasn't run.
+         * Anchor it now and extend again. */
+
+        _cleanup_(iovec_done_erase) struct iovec anchor_secret = {};
+        r = tpm2_nvpcr_acquire_anchor_secret(&anchor_secret, sync_secondary_anchor);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to acquire anchor secret for NvPCR '%s': %m", name);
+
+        r = tpm2_nvpcr_initialize(c, session, name, &anchor_secret);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to initialize NvPCR '%s' with anchor secret: %m", name);
+
+        return nvpcr_extend_bytes(c, session, name, data, secret, event_type, description);
 }
 
 #if HAVE_OPENSSL
@@ -8707,7 +8749,7 @@ int tpm2_nvpcr_initialize(
 
         log_debug("Successfully acquired handle to NV index 0x%" PRIx32 ".", p.nv_index);
 
-        tpm2_userspace_log_dirty(log_fd);
+        bool reset_marker = tpm2_userspace_log_dirty(log_fd) >= 0;
         rc = sym_Esys_NV_Extend(
                         c->esys_context,
                         /* authHandle= */ nv_handle->esys_handle,
@@ -8745,7 +8787,7 @@ int tpm2_nvpcr_initialize(
         if (r < 0)
                 return log_debug_errno(r, "Failed to write anchor file: %m");
 
-        tpm2_userspace_log_clean(log_fd);
+        (void) tpm2_userspace_log_clean(log_fd, reset_marker);
         log_fd = safe_close(log_fd);
 
         /* Now also measure the initialization into PCR 9, so that there's a trace of it in regular PCRs. You
@@ -9658,6 +9700,63 @@ int tpm2_hmac_key_from_pin(Tpm2Context *c, const Tpm2Handle *session, const TPM2
 }
 #endif
 
+int tpm2_argon2id_derive_split(
+                const char *pin,
+                const struct iovec *salt,
+                const Argon2IdParameters *argon2id_params,
+                struct iovec *ret_key1,
+                char **ret_b64_pin) {
+
+        int r;
+        _cleanup_(iovec_done_erase) struct iovec derived = {};
+
+        assert(pin);
+        assert(salt);
+        assert(argon2id_params);
+        assert(ret_key1);
+        assert(ret_b64_pin);
+
+        r = kdf_argon2id_derive(
+                        &IOVEC_MAKE(pin, strlen(pin)),
+                        salt,
+                        argon2id_params,
+                        /* derive_size= */ 64, &derived);
+        if (r < 0)
+                return r;
+
+        assert(derived.iov_len == 64);
+
+        const uint8_t *derived_bytes = derived.iov_base;
+
+        ret_key1->iov_base = memdup(derived_bytes, 32);
+        if (!ret_key1->iov_base)
+                return log_oom();
+        ret_key1->iov_len = 32;
+
+        ssize_t n = base64mem(derived_bytes + 32, 32, ret_b64_pin);
+        if (n < 0)
+                return log_oom();
+
+        return 0;
+}
+
+int tpm2_argon2id_hkdf(
+                const struct iovec *key1,
+                const struct iovec *unsealed,
+                struct iovec *ret_volume_key) {
+
+        assert(key1);
+        assert(key1->iov_len > 0);
+        assert(unsealed);
+        assert(ret_volume_key);
+
+        return kdf_hkdf_sha256(
+                        key1,
+                        unsealed,
+                        &IOVEC_MAKE_STRING("systemd-tpm2-argon2id-lock"),
+                        /* derive_size= */ 32, ret_volume_key);
+}
+
 char* tpm2_pcr_mask_to_string(uint32_t mask) {
         _cleanup_free_ char *s = NULL;
 
@@ -9781,6 +9880,7 @@ int tpm2_make_luks2_json(
                 const struct iovec *srk,
                 const struct iovec *pcrlock_nv,
                 TPM2Flags flags,
+                const Argon2IdParameters *argon2id_params,
                 sd_json_variant **ret) {
 
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL, *hmj = NULL, *pkmj = NULL;
@@ -9791,6 +9891,8 @@ int tpm2_make_luks2_json(
         assert(!pubkey_policy_ref || iovec_is_set(pubkey));
         assert(n_blobs >= 1);
         assert(n_policy_hash >= 1);
+
+        POINTER_MAY_BE_NULL(argon2id_params);
 
         if (asprintf(&keyslot_as_string, "%i", keyslot) < 0)
                 return -ENOMEM;
@@ -9815,6 +9917,11 @@ int tpm2_make_luks2_json(
         if (r < 0)
                 return r;
 
+        const Argon2IdParameters argon2id_params_safe =
+                FLAGS_SET(flags, TPM2_FLAGS_USE_ARGON2ID) && argon2id_params
+                ? *argon2id_params
+                : (Argon2IdParameters) {};
+
         /* Note: We made the mistake of using "-" in the field names, which isn't particular compatible with
          * other programming languages. Let's not make things worse though, i.e. future additions to the JSON
          * object should use "_" rather than "-" in field names. */
@@ -9835,7 +9942,10 @@ int tpm2_make_luks2_json(
                         SD_JSON_BUILD_PAIR_CONDITION(pubkey_policy_ref != NULL, "tpm2_pubkey_ref", SD_JSON_BUILD_STRING(pubkey_policy_ref)),
                         SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(salt), "tpm2_salt", JSON_BUILD_IOVEC_BASE64(salt)),
                         SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(srk), "tpm2_srk", JSON_BUILD_IOVEC_BASE64(srk)),
-                        SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(pcrlock_nv), "tpm2_pcrlock_nv", JSON_BUILD_IOVEC_BASE64(pcrlock_nv)));
+                        SD_JSON_BUILD_PAIR_CONDITION(iovec_is_set(pcrlock_nv), "tpm2_pcrlock_nv", JSON_BUILD_IOVEC_BASE64(pcrlock_nv)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(flags, TPM2_FLAGS_USE_ARGON2ID), "tpm2_argon2id_memcost", SD_JSON_BUILD_UNSIGNED(argon2id_params_safe.memcost_bytes)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(flags, TPM2_FLAGS_USE_ARGON2ID), "tpm2_argon2id_iterations", SD_JSON_BUILD_UNSIGNED(argon2id_params_safe.iterations)),
+                        SD_JSON_BUILD_PAIR_CONDITION(FLAGS_SET(flags, TPM2_FLAGS_USE_ARGON2ID), "tpm2_argon2id_lanes", SD_JSON_BUILD_UNSIGNED(argon2id_params_safe.lanes)));
         if (r < 0)
                 return r;
 
@@ -9918,7 +10028,8 @@ int tpm2_parse_luks2_json(
                 struct iovec *ret_salt,
                 struct iovec *ret_srk,
                 struct iovec *ret_pcrlock_nv,
-                TPM2Flags *ret_flags) {
+                TPM2Flags *ret_flags,
+                Argon2IdParameters *ret_argon2id_params) {
 
         _cleanup_(iovec_done) struct iovec pubkey = {}, salt = {}, srk = {}, pcrlock_nv = {};
         _cleanup_free_ char *pubkey_ref = NULL;
@@ -10068,6 +10179,52 @@ int tpm2_parse_luks2_json(
                         return log_debug_errno(r, "Invalid base64 data in 'tpm2_pcrlock_nv' field.");
         }
 
+        Argon2IdParameters ap = {};
+
+        w = sd_json_variant_by_key(v, "tpm2_argon2id_memcost");
+        if (w) {
+                if (!sd_json_variant_is_unsigned(w))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "tpm2_argon2id_memcost is not an unsigned integer.");
+                ap.memcost_bytes = sd_json_variant_unsigned(w);
+                if (ap.memcost_bytes == 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EUCLEAN), "tpm2_argon2id_memcost must be non-zero.");
+        }
+
+        w = sd_json_variant_by_key(v, "tpm2_argon2id_iterations");
+        if (w) {
+                uint64_t raw_iterations;
+
+                if (!sd_json_variant_is_unsigned(w))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "tpm2_argon2id_iterations is not an unsigned integer.");
+                raw_iterations = sd_json_variant_unsigned(w);
+                if (raw_iterations == 0 || raw_iterations > UINT32_MAX)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EUCLEAN), "tpm2_argon2id_iterations value out of range.");
+                ap.iterations = (uint32_t) raw_iterations;
+        }
+
+        w = sd_json_variant_by_key(v, "tpm2_argon2id_lanes");
+        if (w) {
+                uint64_t raw_lanes;
+
+                if (!sd_json_variant_is_unsigned(w))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "tpm2_argon2id_lanes is not an unsigned integer.");
+                raw_lanes = sd_json_variant_unsigned(w);
+                if (raw_lanes == 0 || raw_lanes > UINT32_MAX)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EUCLEAN), "tpm2_argon2id_lanes value out of range.");
+                ap.lanes = (uint32_t) raw_lanes;
+        }
+
+        if (ap.memcost_bytes > 0 && ap.iterations > 0 && ap.lanes > 0) {
+                if (!iovec_is_set(&salt))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Argon2id PIN requires salt in LUKS2 token.");
+
+                if (ap.memcost_bytes > physical_memory())
+                        return log_debug_errno(SYNTHETIC_ERRNO(EUCLEAN), "Argon2id memory cost exceeds physical memory.");
+
+                SET_FLAG(flags, TPM2_FLAGS_USE_ARGON2ID, true);
+        } else if (ap.memcost_bytes > 0 || ap.iterations > 0 || ap.lanes > 0)
+                return log_debug_errno(SYNTHETIC_ERRNO(EUCLEAN), "Incomplete Argon2id parameters in LUKS2 token.");
+
         if (ret_keyslot)
                 *ret_keyslot = keyslot;
         if (ret_hash_pcr_mask)
@@ -10098,6 +10255,8 @@ int tpm2_parse_luks2_json(
                 *ret_pcrlock_nv = TAKE_STRUCT(pcrlock_nv);
         if (ret_flags)
                 *ret_flags = flags;
+        if (ret_argon2id_params)
+                *ret_argon2id_params = ap;
         return 0;
 }
 

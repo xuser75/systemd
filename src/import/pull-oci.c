@@ -366,7 +366,7 @@ static int oci_pull_redirect_manifest(OciPull *i, const OciIndexEntry *entry) {
 
         j->on_finished = oci_pull_job_on_finished_manifest;
         j->calc_checksum = true;
-        if (!iovec_memdup(&entry->digest, &j->checksum))
+        if (!iovec_memdup(&entry->digest, &j->expected_checksum))
                 return -ENOMEM;
 
         j->description = strjoin("Image Manifest (", url, ")");
@@ -1293,7 +1293,7 @@ static void oci_pull_job_on_finished_layer(PullJob *j) {
                 goto finish;
         }
 
-        assert(set_remove(i->active_layer_jobs, j) == j);
+        assert_se(set_remove(i->active_layer_jobs, j) == j);
 
         r = oci_pull_work(i);
         if (r <= 0)

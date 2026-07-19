@@ -111,6 +111,7 @@ udev_dependencies = [
         libblkid_cflags,
         libkmod_cflags,
         libmount_cflags,
+        libopenssl_cflags,
         libselinux_cflags,
         tpm2_cflags,
 ]
@@ -202,7 +203,7 @@ executables += [
                 'suite' : 'udev',
         },
         udev_test_template + {
-                'sources' : files('net/test-link-config-tables.c'),
+                'sources' : files('net/test-link.c'),
                 'suite' : 'udev',
         },
         udev_test_template + {

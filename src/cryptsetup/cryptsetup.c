@@ -1138,20 +1138,15 @@ static int measure_keyslot(
         if (!s)
                 return log_oom();
 
-        r = tpm2_nvpcr_extend_bytes(c, /* session= */ NULL, arg_tpm2_measure_keyslot_nvpcr, &IOVEC_MAKE_STRING(s), /* secret= */ NULL, TPM2_EVENT_KEYSLOT, s);
-        if (r == -ENETDOWN) {
-                /* NvPCR is not initialized yet. Do so now. */
-                _cleanup_(iovec_done_erase) struct iovec anchor_secret = {};
-                r = tpm2_nvpcr_acquire_anchor_secret(&anchor_secret, /* sync_secondary= */ false);
-                if (r < 0)
-                        return r;
-
-                r = tpm2_nvpcr_initialize(c, /* session= */ NULL, arg_tpm2_measure_keyslot_nvpcr, &anchor_secret);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to extend NvPCR index '%s' with anchor secret: %m", name);
-
-                r = tpm2_nvpcr_extend_bytes(c, /* session= */ NULL, arg_tpm2_measure_keyslot_nvpcr, &IOVEC_MAKE_STRING(s), /* secret= */ NULL, TPM2_EVENT_KEYSLOT, s);
-        }
+        r = tpm2_nvpcr_extend_bytes(
+                        c,
+                        /* session= */ NULL,
+                        arg_tpm2_measure_keyslot_nvpcr,
+                        &IOVEC_MAKE_STRING(s),
+                        /* secret= */ NULL,
+                        /* sync_secondary_anchor= */ false,
+                        TPM2_EVENT_KEYSLOT,
+                        s);
         if (r < 0)
                 return log_error_errno(r, "Could not extend NvPCR: %m");
 
@@ -2070,6 +2065,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                         until,
                                         "cryptsetup.tpm2-pin",
                                         arg_ask_password_flags,
+                                        /* argon2id_params= */ NULL,
                                         &decrypted_key);
                         if (r >= 0)
                                 break;
@@ -2115,6 +2111,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                 uint32_t hash_pcr_mask, pubkey_pcr_mask;
                                 size_t n_blobs = 0, n_policy_hash = 0;
                                 uint16_t pcr_bank, primary_alg;
+                                Argon2IdParameters argon2id_params = {};
                                 TPM2Flags tpm2_flags;
 
                                 CLEANUP_ARRAY(blobs, n_blobs, iovec_array_free);
@@ -2139,7 +2136,8 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                                 &pcrlock_nv,
                                                 &tpm2_flags,
                                                 &keyslot,
-                                                &token);
+                                                &token,
+                                                &argon2id_params);
                                 if (r == -ENXIO)
                                         /* No further TPM2 tokens found in the LUKS2 header. */
                                         return log_full_errno(found_some ? LOG_NOTICE : LOG_DEBUG,
@@ -2179,6 +2177,7 @@ static int attach_luks_or_plain_or_bitlk_by_tpm2(
                                                 until,
                                                 "cryptsetup.tpm2-pin",
                                                 arg_ask_password_flags,
+                                                &argon2id_params,
                                                 &decrypted_key);
                                 if (IN_SET(r, -EACCES, -ENOLCK))
                                         return log_notice_errno(SYNTHETIC_ERRNO(EAGAIN), "TPM2 PIN unlock failed, falling back to traditional unlocking.");

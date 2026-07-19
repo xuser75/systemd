@@ -873,6 +873,10 @@ units = [
           'conditions' : ['ENABLE_SYSINSTALL'],
         },
         {
+          'file' : 'systemd-sysupdate-auto-enable.service',
+          'conditions' : ['ENABLE_SYSUPDATE'],
+        },
+        {
           'file' : 'systemd-sysupdate-reboot.service',
           'conditions' : ['ENABLE_SYSUPDATE'],
         },
@@ -1040,7 +1044,7 @@ units = [
           'conditions' : ['ENABLE_NSRESOURCED'],
         },
         {
-          'file' : 'systemd-nsresourced.socket',
+          'file' : 'systemd-nsresourced.socket.in',
           'conditions' : ['ENABLE_NSRESOURCED'],
         },
         {
