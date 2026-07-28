@@ -132,6 +132,7 @@ extern DLSYM_PROTOTYPE(ERR_error_string_n);
 extern DLSYM_PROTOTYPE(ERR_get_error);
 extern DLSYM_PROTOTYPE(EVP_CIPHER_CTX_ctrl);
 extern DLSYM_PROTOTYPE(EVP_CIPHER_CTX_free);
+extern DLSYM_PROTOTYPE(EVP_CIPHER_CTX_get_tag_length);
 extern DLSYM_PROTOTYPE(EVP_CIPHER_CTX_new);
 extern DLSYM_PROTOTYPE(EVP_CIPHER_free);
 extern DLSYM_PROTOTYPE(EVP_CIPHER_get_block_size);
@@ -391,6 +392,8 @@ static inline int openssl_cipher(const char *alg, size_t bits, const char *mode,
 int kdf_ss_derive(const char *digest, const void *key, size_t key_size, const void *salt, size_t salt_size, const void *info, size_t info_size, size_t derive_size, void **ret);
 
 int kdf_kb_hmac_derive(const char *mode, const char *digest, const void *key, size_t key_size, const void *salt, size_t salt_size, const void *info, size_t info_size, const void *seed, size_t seed_size, size_t derive_size, void **ret);
+
+int kdf_hkdf_derive(const char *digest, const struct iovec *key, const struct iovec *salt, const struct iovec *info, size_t derive_size, struct iovec *ret);
 
 int rsa_oaep_encrypt_bytes(const EVP_PKEY *pkey, const char *digest_alg, const char *label, const void *decrypted_key, size_t decrypted_key_size, void **ret_encrypt_key, size_t *ret_encrypt_key_size);
 
