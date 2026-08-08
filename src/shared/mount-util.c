@@ -1810,7 +1810,6 @@ int get_sub_mounts(const char *prefix, SubMount **ret_mounts, size_t *ret_n_moun
                 _cleanup_free_ char *p = NULL;
                 struct libmnt_fs *fs;
                 const char *path;
-                int id1, id2;
 
                 r = sym_mnt_table_next_fs(table, iter, &fs);
                 if (r == 1)
@@ -1825,18 +1824,11 @@ int get_sub_mounts(const char *prefix, SubMount **ret_mounts, size_t *ret_n_moun
                 if (isempty(path_startswith(path, prefix)))
                         continue;
 
-                id1 = sym_mnt_fs_get_id(fs);
-                r = path_get_mnt_id(path, &id2);
-                if (r < 0) {
-                        log_debug_errno(r, "Failed to get mount ID of '%s', ignoring: %m", path);
+                /* The path may be hidden by another over-mount or already remounted; skip it in that case
+                 * (libmount_fs_id_matches_path() already logs the details at debug level). */
+                r = libmount_fs_id_matches_path(fs, path);
+                if (r <= 0)
                         continue;
-                }
-                if (id1 != id2) {
-                        /* The path may be hidden by another over-mount or already remounted. */
-                        log_debug("The mount IDs of '%s' obtained by libmount and path_get_mnt_id() are different (%i vs %i), ignoring.",
-                                  path, id1, id2);
-                        continue;
-                }
 
                 /* If possible on a newer kernel, use MS_PRIVATE to decouple it from the original mount.
                  * Otherwise MNT_DETACH of the source path could propagate through and unmount the
@@ -1954,7 +1946,7 @@ int make_mount_point_inode_from_mode(int dir_fd, const char *dest, mode_t source
         assert(dest);
 
         if (S_ISDIR(source_mode))
-                return mkdirat_label(dir_fd, dest, target_mode & 07777);
+                return mkdirat_label(dir_fd, dest, target_mode & 07777, /* label_context= */ NULL);
         else
                 return RET_NERRNO(mknodat(dir_fd, dest, S_IFREG|(target_mode & 07666), 0)); /* Mask off X bit */
 }

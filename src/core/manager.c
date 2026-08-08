@@ -1056,13 +1056,7 @@ int manager_new(RuntimeScope runtime_scope, ManagerTestRunFlags test_run_flags, 
                                 return r;
                 }
 
-#if HAVE_LIBBPF
-                if (MANAGER_IS_SYSTEM(m) && bpf_restrict_fs_supported(/* initialize= */ true)) {
-                        r = bpf_restrict_fs_setup(m);
-                        if (r < 0)
-                                log_warning_errno(r, "Failed to setup LSM BPF, ignoring: %m");
-                }
-#endif
+                (void) bpf_restrict_fs_setup(m);
         }
 
         if (test_run_flags == 0) {
@@ -2891,6 +2885,14 @@ static unsigned manager_dispatch_dbus_queue(Manager *m) {
         Job *j;
 
         assert(m);
+
+        /* If the API bus is connected but not fully set up yet (see bus_init_api()), postpone
+         * dispatching the queue, otherwise subscribers restored from a previous reexec would miss
+         * messages. The pending Varlink reload reply does not depend on the API bus, but it is held
+         * back too, so that the order between D-Bus messages and Varlink replies is preserved for
+         * clients that monitor both. */
+        if (m->api_bus && !m->api_bus_ready)
+                return 0;
 
         /* When we are reloading, let's not wait with generating signals, since we need to exit the manager as quickly
          * as we can. There's no point in throttling generation of signals in that case. */

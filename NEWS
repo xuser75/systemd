@@ -4,6 +4,12 @@ CHANGES WITH 262:
 
         Feature Removals and Incompatible Changes:
 
+        * Services of Type=notify-reload are now required to catch or block
+          ReloadSignal= when they send READY=1. If they do neither at that
+          point, the service fails to start with a protocol error. Previously,
+          such services were allowed to start even though a later reload could
+          invoke the signal's default action and terminate the service.
+
         * systemd-repart's MakeSymlinks= option now expands "%" specifiers in
           the symlink target. Previously, these were only expanded in the
           source.
@@ -30,6 +36,12 @@ CHANGES WITH 262:
           TPM-bound credentials minted after this change are not recognized by
           older systemd versions, however systemd continues to accept TPM-sealed
           credentials that were created before this change.
+
+        * The "tpm2-measure-bank=" crypttab option of systemd-cryptsetup is
+          now deprecated and has no effect. Volume key measurements are
+          performed via varlink call to systemd-pcrextend, which automatically
+          selects all suitable TPM2 PCR banks; the banks can no longer be
+          restricted per volume.
 
         * The legacy socket for controlling systemd-udevd has been removed, and
           udevadm now unconditionally uses Varlink IPC. The legacy UNIX socket
@@ -68,6 +80,22 @@ CHANGES WITH 262:
           IPv4ProxyARP=yes but has no effect if IPv4ProxyARP= has been set to
           false. This mirrors the behavior of IPv6ProxyNDPAddress=.
 
+        Changes in various tools:
+
+        * bootctl, systemd-oomd, systemd-repart, systemd-sysusers, and
+          systemd-tmpfiles now accept -n as a short option for --dry-run.
+
+        Changes in systemd-tmpfiles:
+
+        * systemd-tmpfiles now rejects non-empty argument fields for tmpfiles.d
+          line types that do not use the argument field. This is a compatibility
+          change: fields that were previously ignored after a warning will now
+          cause the tmpfiles.d configuration to be rejected, so downstreams
+          should audit shipped tmpfiles.d snippets before upgrading.
+
+        * The r and R tmpfiles.d line types now honor the age field when
+          systemd-tmpfiles is invoked with --clean.
+
         Changes in the TPM Subsystem:
 
         * The way that NvPCRs are anchored has been improved. They are now
@@ -84,6 +112,19 @@ CHANGES WITH 262:
           created with a previous systemd version will be automatically
           upgraded, and the existing "anchor secret" stored in /var/lib and the
           ESP/XBOOTLDR will be removed.
+
+        Changes in systemd-report:
+
+        * The "generate" and "upload" commands of systemd-report can now
+          cryptographically sign the reports they produce. Signatures are
+          acquired from backend Varlink signers linked into
+          /run/systemd/report.sign/. The new "--sign=" option selects the
+          signing policy: "no" (the default) emits an unsigned report;
+          "best-effort" attaches whatever signatures can be acquired but never
+          fails; "require-one" requires at least one signature; and
+          "require-all" requires every available signer to succeed. A signed
+          report is emitted as a JSON-SEQ stream: the report object followed by
+          one signature object per acquired signature.
 
 CHANGES WITH 261:
 

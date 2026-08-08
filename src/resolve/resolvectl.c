@@ -278,6 +278,31 @@ static void print_ifindex_comment(int printed_so_far, int ifindex) {
                ansi_grey(), ifname, ansi_normal());
 }
 
+static int dump_resolve_error_json(const char *name, const char *error_id, sd_json_variant *parameters, int ret) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
+        int r;
+
+        assert(name);
+        assert(!isempty(error_id));
+
+        if (parameters)
+                j = sd_json_variant_ref(parameters);
+
+        r = sd_json_variant_set_field_string(&j, "name", name);
+        if (r < 0)
+                return r;
+
+        r = sd_json_variant_set_field_string(&j, "error", error_id);
+        if (r < 0)
+                return r;
+
+        r = sd_json_variant_dump(j, arg_json_format_flags, /* f= */ NULL, /* prefix= */ NULL);
+        if (r < 0)
+                return r;
+
+        return ret;
+}
+
 static int varlink_log_resolve_error(const char *name, const char *error_id, sd_json_variant *reply, bool warn_missing) {
         int r;
 
@@ -285,6 +310,26 @@ static int varlink_log_resolve_error(const char *name, const char *error_id, sd_
         assert(!isempty(error_id));
 
         int ret = sd_varlink_error_to_errno(error_id, reply);
+        _cleanup_(resolve_error_done) ResolveError error = {
+                .rcode = _DNS_RCODE_INVALID,
+                .ede_rcode = _DNS_EDE_RCODE_INVALID,
+        };
+        if (reply) {
+                r = dispatch_resolve_error(/* name = */ NULL, reply, SD_JSON_LOG, &error);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to dispatch error JSON, ignoring: %m");
+        }
+
+        if (error.rcode == DNS_RCODE_NXDOMAIN && !warn_missing)
+                return -ENXIO;
+
+        if (sd_json_format_enabled(arg_json_format_flags))
+                return dump_resolve_error_json(
+                                name,
+                                error_id,
+                                reply,
+                                error.rcode == DNS_RCODE_NXDOMAIN ? -ENXIO : ret);
+
         static const struct {
                 const char *error_id;
                 const char *msg;
@@ -318,14 +363,6 @@ static int varlink_log_resolve_error(const char *name, const char *error_id, sd_
         if (streq(error_id, "io.systemd.Resolve.InconsistentServiceRecords"))
                 return log_error_errno(ret, "%s: resolve call failed: '%s' does not provide a consistent set of service resource records", name, name);
 
-        _cleanup_(resolve_error_done) ResolveError error = {
-                .rcode = _DNS_RCODE_INVALID,
-                .ede_rcode = _DNS_EDE_RCODE_INVALID,
-        };
-        r = dispatch_resolve_error(/* name = */ NULL, reply, SD_JSON_LOG, &error);
-        if (r < 0)
-                log_debug_errno(r, "Failed to dispatch error JSON, ignoring: %m");
-
         _cleanup_free_ char *msg_extended = NULL;
         if (error.ede_rcode >= 0) {
                 msg_extended = strjoin(" (",
@@ -342,9 +379,6 @@ static int varlink_log_resolve_error(const char *name, const char *error_id, sd_
 
         if (error.rcode != _DNS_RCODE_INVALID) {
                 if (error.rcode == DNS_RCODE_NXDOMAIN) {
-                        if (!warn_missing)
-                                return -ENXIO;
-
                         return log_error_errno(SYNTHETIC_ERRNO(ENXIO), "%s: resolve call failed: Name '%s' not found%s%s",
                                                name, error.query_string ?: name, error.ede_rcode >= 0 ? ":" : "", strempty(msg_extended));
                 }
@@ -567,6 +601,8 @@ static int output_rr_packet(DnsResourceRecord *rr, int ifindex) {
         return 0;
 }
 
+static DEFINE_POINTER_ARRAY_FREE_FUNC(DnsResourceRecord*, dns_resource_record_unref);
+
 static int idna_candidate(const char *name, char **ret) {
         _cleanup_free_ char *idnafied = NULL;
         int r;
@@ -668,12 +704,39 @@ static int resolve_record(const char *name, uint16_t class, uint16_t type, bool 
         if (r < 0)
                 return r;
 
+        if (reply.n_records == 0) {
+                if (warn_missing)
+                        log_error("%s: no records found", name);
+                return -ESRCH;
+        }
+
+        DnsResourceRecord **rrs = new0(DnsResourceRecord*, reply.n_records);
+        size_t n_rrs = reply.n_records;
+        if (!rrs)
+                return log_oom();
+        CLEANUP_ARRAY(rrs, n_rrs, dns_resource_record_unref_array);
+
+        bool json = sd_json_format_enabled(arg_json_format_flags);
         bool needs_authentication = false;
         FOREACH_ARRAY(record, reply.records, reply.n_records) {
-                _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
-                r = dns_resource_record_new_from_raw(&rr, record->raw.iov_base, record->raw.iov_len);
+                size_t i = record - reply.records;
+
+                r = dns_resource_record_new_from_raw(&rrs[i], record->raw.iov_base, record->raw.iov_len);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse RR: %m");
+
+                if (dns_type_needs_authentication(rrs[i]->key->type)) {
+                        needs_authentication = true;
+
+                        if (json && !FLAGS_SET(reply.flags, SD_RESOLVED_AUTHENTICATED))
+                                return log_error_errno(SYNTHETIC_ERRNO(EKEYREJECTED),
+                                                       "Refusing to output unauthenticated DNS records that require "
+                                                       "authentication in JSON format.");
+                }
+        }
+
+        FOREACH_ARRAY(record, reply.records, reply.n_records) {
+                size_t i = record - reply.records;
 
                 if (arg_raw == RAW_PACKET) {
                         uint64_t u64 = htole64(record->raw.iov_len);
@@ -681,19 +744,10 @@ static int resolve_record(const char *name, uint16_t class, uint16_t type, bool 
                         fwrite(&u64, sizeof(u64), 1, stdout);
                         fwrite(record->raw.iov_base, 1, record->raw.iov_len, stdout);
                 } else {
-                        r = output_rr_packet(rr, record->ifindex);
+                        r = output_rr_packet(rrs[i], record->ifindex);
                         if (r < 0)
                                 return r;
                 }
-
-                if (dns_type_needs_authentication(rr->key->type))
-                        needs_authentication = true;
-        }
-
-        if (reply.n_records == 0) {
-                if (warn_missing)
-                        log_error("%s: no records found", name);
-                return -ESRCH;
         }
 
         print_source(reply.flags, ts);
@@ -1042,8 +1096,8 @@ static int verb_openpgp(int argc, char *argv[], uintptr_t _data, void *userdata)
 #if HAVE_OPENSSL
         int ret = 0;
 
-        if (sd_json_format_enabled(arg_json_format_flags))
-                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Use --json=pretty with --type= to acquire resource record information in JSON format.");
+        if (!IN_SET(arg_type, 0, DNS_TYPE_OPENPGPKEY))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The openpgp command may only be combined with --type=OPENPGPKEY.");
 
         STRV_FOREACH(p, strv_skip(argv, 1))
                 RET_GATHER(ret, resolve_openpgp(*p));
@@ -1098,8 +1152,8 @@ static int verb_tlsa(int argc, char *argv[], uintptr_t _data, void *userdata) {
 
         assert(argc >= 2);
 
-        if (sd_json_format_enabled(arg_json_format_flags))
-                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Use --json=pretty with --type= to acquire resource record information in JSON format.");
+        if (!IN_SET(arg_type, 0, DNS_TYPE_TLSA))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "The tlsa command may only be combined with --type=TLSA.");
 
         if (service_family_is_valid(argv[1])) {
                 family = argv[1];
@@ -3658,6 +3712,9 @@ static int native_parse_argv(int argc, char *argv[], char ***remaining_args) {
                         arg_json_format_flags = SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO;
                         break;
                 }
+
+        if (arg_raw != RAW_NONE && sd_json_format_enabled(arg_json_format_flags))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--raw and --json= may not be combined.");
 
         if (arg_type == 0 && arg_class != 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
