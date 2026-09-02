@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "sd-event.h"
+#include "sd-json.h"
 #include "sd-varlink.h"
 
 #include "alloc-util.h"
@@ -9,11 +10,9 @@
 #include "dirent-util.h"
 #include "dlopen-note.h"
 #include "format-table.h"
-#include "help-util.h"
 #include "json-util.h"
 #include "log.h"
 #include "main-func.h"
-#include "options.h"
 #include "parse-argument.h"
 #include "path-lookup.h"
 #include "recurse-dir.h"
@@ -55,6 +54,13 @@ STATIC_DESTRUCTOR_REGISTER(arg_key, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_cert, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_trust, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_extra_headers, strv_freep);
+
+COMMAND(
+        "systemd-report\0",
+        "Acquire metrics from local sources.",
+        .man_pages = "systemd-report(1)\0",
+        .pager_flags = &arg_pager_flags,
+);
 
 typedef struct LinkInfo {
         Context *context;
@@ -644,13 +650,13 @@ static int context_collect_metrics(Context *context) {
         return 1;
 }
 
-VERB_FULL(verb_metrics, "metrics", "[MATCH…]", VERB_ANY, VERB_ANY, 0, ACTION_LIST_METRICS,
+VERB_FULL(verb_metrics, "metrics", "[MATCH…]\0", VERB_ANY, VERB_ANY, 0, ACTION_LIST_METRICS,
           "Acquire list of metrics and their values");
-VERB_FULL(verb_metrics, "describe", "[MATCH…]", VERB_ANY, VERB_ANY, 0, ACTION_DESCRIBE_METRICS,
+VERB_FULL(verb_metrics, "describe", "[MATCH…]\0", VERB_ANY, VERB_ANY, 0, ACTION_DESCRIBE_METRICS,
           "Describe available metrics");
-VERB_FULL(verb_metrics, "generate", "[MATCH…]", VERB_ANY, VERB_ANY, 0, ACTION_GENERATE,
+VERB_FULL(verb_metrics, "generate", "[MATCH…]\0", VERB_ANY, VERB_ANY, 0, ACTION_GENERATE,
           "Build a report with metrics");
-VERB_FULL(verb_metrics, "upload", "[MATCH…]", VERB_ANY, VERB_ANY, 0, ACTION_UPLOAD,
+VERB_FULL(verb_metrics, "upload", "[MATCH…]\0", VERB_ANY, VERB_ANY, 0, ACTION_UPLOAD,
           "Upload a report with metrics");
 static int verb_metrics(int argc, char *argv[], uintptr_t data, void *userdata) {
         Action action = data;
@@ -918,39 +924,7 @@ static int vl_server(void) {
         return 0;
 }
 
-static int help(void) {
-        int r;
-
-        _cleanup_(table_unrefp) Table *verbs = NULL, *options = NULL;
-        r = verbs_get_help_table(&verbs);
-        if (r < 0)
-                return r;
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        (void) table_sync_column_widths(0, options, verbs);
-
-        help_cmdline("[OPTIONS...] COMMAND ...");
-        help_abstract("Acquire metrics from local sources.");
-        help_section("Commands");
-
-        r = table_print_or_warn(verbs);
-        if (r < 0)
-                return r;
-
-        help_section("Options");
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        help_man_page_reference("systemd-report", "1");
-        return 0;
-}
-
-VERB_COMMON_HELP_HIDDEN(help);
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 static int parse_argv(int argc, char *argv[], char ***ret_args) {
         int r;
@@ -963,7 +937,7 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
         FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -1048,6 +1022,9 @@ static int parse_argv(int argc, char *argv[], char ***ret_args) {
                         if (arg_sign_mode < 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse --sign= mode '%s'.", opts.arg);
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(arg_json_format_flags);
                 }
 
         if ((arg_url || arg_key || arg_cert || arg_trust || arg_extra_headers) && !HAVE_LIBCURL)

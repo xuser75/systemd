@@ -1,3 +1,4 @@
 # AGENTS.md
 
-No more AI generated or modified code is allowed on this fork of systemd.
+Upstream AI generated code from systemd/systemd is allowed.
+No other AI generated or modified code is allowed on this fork of systemd.

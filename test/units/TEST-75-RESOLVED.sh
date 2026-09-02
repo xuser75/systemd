@@ -273,6 +273,9 @@ manual_testcase_01_resolvectl() {
     assert_in 'test-domain1.example.com' "$(resolvectl domain hoge)"
     assert_in 'test-domain2.example.com' "$(resolvectl domain hoge)"
     assert_in 'test-search-domain.example.com' "$(resolvectl domain hoge)"
+    resolvectl domain hoge keep.example
+    (! echo -e "nameserver 10.0.2.1\nsearch \"unterminated" | SYSTEMD_INVOKED_AS=resolvconf resolvectl -a hoge)
+    assert_in 'keep.example' "$(resolvectl domain hoge)"
 
     # Tests for 'resolvconf -x'
     echo nameserver 10.0.2.1 | SYSTEMD_INVOKED_AS=resolvconf resolvectl -x -a hoge
@@ -280,6 +283,31 @@ manual_testcase_01_resolvectl() {
     resolvectl domain hoge "hoge.example.com"
     assert_in 'hoge.example.com' "$(resolvectl domain hoge)"
     assert_not_in '~.' "$(resolvectl domain hoge)"
+
+    local hoge_state
+    hoge_state="/run/systemd/resolve/netif/$(cat /sys/class/net/hoge/ifindex)"
+    resolvectl domain hoge "route-only-change.example.com"
+    assert_in "DOMAINS=route-only-change.example.com" "$(cat "$hoge_state")"
+    assert_in "route-only-change.example.com" "$(cat /run/systemd/resolve/resolv.conf /run/systemd/resolve/stub-resolv.conf)"
+    resolvectl domain hoge "~route-only-change.example.com"
+    assert_in "DOMAINS=~route-only-change.example.com" "$(cat "$hoge_state")"
+    assert_not_in "route-only-change.example.com" "$(cat /run/systemd/resolve/resolv.conf /run/systemd/resolve/stub-resolv.conf)"
+
+    resolvectl domain hoge "old.example.com"
+    local domains=()
+    for i in {1..1025}; do
+        domains+=("too-many-$i.example.com")
+    done
+    (! resolvectl domain hoge "${domains[@]}")
+    assert_in 'old.example.com' "$(resolvectl domain hoge)"
+
+    domains=()
+    for i in {1..1024}; do
+        domains+=("replacement-$i.example.com")
+    done
+    resolvectl domain hoge "${domains[@]}"
+    assert_not_in 'old.example.com' "$(resolvectl domain hoge)"
+    assert_in 'replacement-1024.example.com' "$(resolvectl domain hoge)"
     echo -e "nameserver 10.0.2.1\ndomain test-domain.example.com" | SYSTEMD_INVOKED_AS=resolvconf resolvectl -x -a hoge
     assert_in 'test-domain.example.com' "$(resolvectl domain hoge)"
     assert_in '~.' "$(resolvectl domain hoge)"
@@ -308,6 +336,11 @@ manual_testcase_01_resolvectl() {
     assert_in '_localdnsstub' "$(dig @127.0.0.53 -x 127.0.0.53)"
     assert_in '127.0.0.54' "$(dig @127.0.0.53 _localdnsproxy)"
     assert_in '_localdnsproxy' "$(dig @127.0.0.53 -x 127.0.0.54)"
+
+    resolvectl log-level warning
+    assert_eq "$(resolvectl log-level)" "warning"
+    resolvectl log-level debug
+    assert_eq "$(resolvectl log-level)" "debug"
 }
 
 # Tests for mDNS and LLMNR settings
@@ -555,6 +588,10 @@ testcase_08_resolved() {
     run resolvectl query signed.test
     grep -qF "signed.test: 10.0.0.10" "$RUN_OUT"
     grep -qF "authenticated: yes" "$RUN_OUT"
+    (! run resolvectl --raw query localhost)
+    grep -qF -- "--raw may only be combined with --type= or dns: URIs." "$RUN_OUT"
+    resolvectl --raw=packet query --type=A signed.test >"$RUN_OUT"
+    test -s "$RUN_OUT"
     run dig @ns1.unsigned.test +short MX signed.test
     grep -qF "10 mail.signed.test." "$RUN_OUT"
     run resolvectl query --legend=no -t MX signed.test
@@ -569,10 +606,13 @@ testcase_08_resolved() {
     # Check SRV support
     run resolvectl service _mysvc._tcp signed.test
     grep -qF "myservice.signed.test:1234" "$RUN_OUT"
-    grep -qF "This is TXT for myservice" "$RUN_OUT"
+    (! grep -qF "This is TXT for myservice" "$RUN_OUT")
     grep -qF "10.0.0.20" "$RUN_OUT"
     grep -qF "fd00:dead:beef:cafe::17" "$RUN_OUT"
     grep -qF "authenticated: yes" "$RUN_OUT"
+    run resolvectl service "" _mysvc._tcp signed.test
+    grep -qF "myservice.signed.test:1234" "$RUN_OUT"
+    grep -qF "This is TXT for myservice" "$RUN_OUT"
 
     # Test service resolve over Varlink
     run varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveService '{"name":"","type":"_mysvc._tcp","domain":"signed.test"}'
@@ -617,6 +657,8 @@ testcase_08_resolved() {
     grep -qF '"data":"' "$RUN_OUT"
     (! run resolvectl openpgp mr.smith@signed.test --json=short --type=A)
     grep -qF -- "The openpgp command may only be combined with --type=OPENPGPKEY." "$RUN_OUT"
+    (! run resolvectl tlsa tcp)
+    grep -qF -- "The tlsa command requires at least one domain." "$RUN_OUT"
     (! run resolvectl tlsa signed.test:invalid --json=short)
     grep -qF 'Invalid port "invalid".' "$RUN_OUT"
     (! run resolvectl tlsa signed.test --json=short --type=A)
@@ -1328,7 +1370,7 @@ testcase_14_refuse_record_types() {
 
     run resolvectl service _mysvc._tcp signed.test
     grep -qF "myservice.signed.test:1234" "$RUN_OUT"
-    grep -qF "This is TXT for myservice" "$RUN_OUT"
+    (! grep -qF "This is TXT for myservice" "$RUN_OUT")
     grep -qF "10.0.0.20" "$RUN_OUT"
     (! grep -qF "fd00:dead:beef:cafe::17" "$RUN_OUT")
     grep -qF "authenticated: yes" "$RUN_OUT"
@@ -1350,7 +1392,7 @@ testcase_14_refuse_record_types() {
 
     run resolvectl service _mysvc._tcp signed.test
     grep -qF "myservice.signed.test:1234" "$RUN_OUT"
-    grep -qF "This is TXT for myservice" "$RUN_OUT"
+    (! grep -qF "This is TXT for myservice" "$RUN_OUT")
     (! grep -qF "10.0.0.20" "$RUN_OUT")
     (! grep -qF "fd00:dead:beef:cafe::17" "$RUN_OUT")
     grep -qF "authenticated: yes" "$RUN_OUT"
@@ -1481,7 +1523,7 @@ testcase_delegate() {
     mkdir -p /run/systemd/dns-delegate.d/
     cat >/run/systemd/dns-delegate.d/testcase.dns-delegate <<EOF
 [Delegate]
-DNS=192.168.77.78
+DNS=192.168.77.78 192.168.77.78 192.168.77.79
 Domains=exercise.test
 FirewallMark=42
 EOF
@@ -1489,6 +1531,7 @@ EOF
     resolvectl status
 
     assert_eq "$(resolvectl --json=short | jq -rc '.[] | select(.delegate == "testcase") | .servers | .[0].addressString')" '192.168.77.78'
+    assert_eq "$(resolvectl --json=short | jq -rc '.[] | select(.delegate == "testcase") | .servers | .[1].addressString')" '192.168.77.79'
     assert_eq "$(resolvectl --json=short | jq -rc '.[] | select(.delegate == "testcase") | .searchDomains | .[0].name')" 'exercise.test'
 
     # Now that we installed the delegation the resolution should fail, because nothing is listening on that IP address

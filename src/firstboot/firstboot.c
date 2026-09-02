@@ -5,6 +5,7 @@
 
 #include "sd-bus.h"
 #include "sd-id128.h"
+#include "sd-json.h"
 #include "sd-varlink.h"
 
 #include "alloc-util.h"
@@ -26,10 +27,8 @@
 #include "fd-util.h"
 #include "fileio.h"
 #include "firstboot-util.h"
-#include "format-table.h"
 #include "fs-util.h"
 #include "glyph-util.h"
-#include "help-util.h"
 #include "hostname-setup.h"
 #include "hostname-util.h"
 #include "image-policy.h"
@@ -43,7 +42,6 @@
 #include "main-func.h"
 #include "memory-util.h"
 #include "mount-util.h"
-#include "options.h"
 #include "os-util.h"
 #include "parse-argument.h"
 #include "password-quality-util.h"
@@ -60,6 +58,7 @@
 #include "tmpfile-util.h"
 #include "user-util.h"
 #include "vconsole-util.h"
+#include "verbs.h"
 
 static char *arg_root = NULL;
 static char *arg_image = NULL;
@@ -109,6 +108,12 @@ STATIC_DESTRUCTOR_REGISTER(arg_root_shell, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_kernel_cmdline, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_image_policy, image_policy_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_label_context, mac_label_context_freep);
+
+COMMAND(
+        "systemd-firstboot\0",
+        "Configure basic settings of the system.",
+        .man_pages = "systemd-firstboot(1)\0",
+);
 
 static bool welcome_done = false;
 
@@ -772,19 +777,46 @@ static int process_hostname(int rfd, sd_varlink **mute_console_link) {
          * and let it be resolved on each first boot. */
         const char *hostname = arg_hostname;
         _cleanup_free_ char *resolved = NULL;
+        _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
         if (!arg_root) {
                 r = hostname_substitute_wildcards(arg_hostname, &resolved);
                 if (r < 0)
                         log_warning_errno(r, "Failed to resolve wildcards in hostname '%s', writing it verbatim: %m", arg_hostname);
                 else if (!hostname_is_valid(resolved, VALID_HOSTNAME_TRAILING_DOT))
                         log_warning("Resolved hostname '%s' is invalid, writing template '%s' verbatim instead.", resolved, arg_hostname);
-                else
+                else {
                         hostname = resolved;
+
+                        r = sd_varlink_connect_address(&vl, "/run/systemd/io.systemd.Hostname");
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to connect to systemd-hostnamed, writing /etc/hostname directly: %m");
+                }
         }
 
-        r = write_string_file_full_label(pfd, f, hostname,
-                                   WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_SYNC|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL,
-                                   /* ts= */ NULL, /* label_fn= */ NULL, arg_label_context);
+        if (vl) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
+                const char *error_id = NULL;
+                r = sd_varlink_callbo(
+                                vl,
+                                "io.systemd.Hostname.SetStaticHostname",
+                                &reply,
+                                &error_id,
+                                SD_JSON_BUILD_PAIR_STRING("newValue", hostname));
+                if (r < 0)
+                        log_warning_errno(r, "Failed to call io.systemd.Hostname.SetStaticHostname, writing /etc/hostname directly: %m");
+                else if (error_id)
+                        log_warning_errno(sd_varlink_error_to_errno(error_id, reply),
+                                          "Failed to set static hostname, writing /etc/hostname directly: %s", error_id);
+                else {
+                        log_info("Static hostname configured via systemd-hostnamed.");
+                        return 0;
+                }
+        }
+
+        r = write_string_file_full_label(
+                        pfd, f, hostname,
+                        WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_SYNC|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL,
+                        /* ts= */ NULL, /* label_fn= */ NULL, arg_label_context);
         if (r < 0)
                 return log_error_errno(r, "Failed to write /etc/hostname: %m");
 
@@ -1378,26 +1410,6 @@ static int process_reset(int rfd) {
         return 0;
 }
 
-static int help(void) {
-        _cleanup_(table_unrefp) Table *options = NULL;
-        int r;
-
-        r = option_parser_get_help_table(&options);
-        if (r < 0)
-                return r;
-
-        help_cmdline("[OPTIONS...]");
-        help_abstract("Configures basic settings of the system.");
-        help_section("Options");
-
-        r = table_print_or_warn(options);
-        if (r < 0)
-                return r;
-
-        help_man_page_reference("systemd-firstboot", "1");
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
         assert(argc >= 0);
         assert(argv);
@@ -1409,7 +1421,7 @@ static int parse_argv(int argc, char *argv[]) {
                 switch (c) {
 
                 OPTION_COMMON_HELP:
-                        return help();
+                        return command_print_help();
 
                 OPTION_COMMON_VERSION:
                         return version();
@@ -1628,6 +1640,9 @@ static int parse_argv(int argc, char *argv[]) {
                 OPTION_LONG("reset", NULL, "Remove existing files"):
                         arg_reset = true;
                         break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         if (arg_delete_root_password && (arg_copy_root_password || arg_root_password || arg_prompt_root_password))

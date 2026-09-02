@@ -27,8 +27,8 @@ else
         project_minor_version = '0'
 endif
 
-libsystemd_version = '0.44.0'
-libudev_version = '1.7.14'
+libsystemd_version = '0.45.0'
+libudev_version = '1.7.15'
 
 conf = configuration_data()
 conf.set_quoted('PROJECT_URL', 'https://systemd.io/')
@@ -2907,7 +2907,7 @@ if spatch.found()
                                 args : [meson.project_source_root() / dir,
                                         meson.project_source_root() / 'coccinelle'],
                                 suite : 'coccinelle',
-                                timeout : 120,
+                                timeout : 300,
                         )
                 endif
         endforeach

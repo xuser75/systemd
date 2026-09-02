@@ -1670,10 +1670,35 @@ static unsigned manager_dispatch_stop_notify_queue(Manager *m) {
         return n;
 }
 
+static void manager_clear_unit_dependencies(Manager *m) {
+        Unit *u;
+        const char *name;
+
+        assert(m);
+
+        HASHMAP_FOREACH_KEY(u, name, m->units) {
+
+                /* ignore aliases */
+                if (u->id != name)
+                        continue;
+
+                for (Hashmap *dependencies; (dependencies = hashmap_steal_first(u->dependencies));)
+                        hashmap_free(dependencies);
+
+                u->dependencies = hashmap_free(u->dependencies);
+                u->dependency_generation++;
+        }
+}
+
 static void manager_clear_jobs_and_units(Manager *m) {
         Unit *u;
 
         assert(m);
+
+        /* All units are going away, hence discard the full dependency graph in one pass. Otherwise
+         * unit_free() removes every edge from both endpoints separately, which becomes very costly with
+         * large numbers of synthesized mount units. */
+        manager_clear_unit_dependencies(m);
 
         while ((u = hashmap_first(m->units)))
                 unit_free(u);
@@ -2023,6 +2048,7 @@ static bool manager_dbus_is_running(Manager *m, bool deserialized) {
                 return false;
         if (!IN_SET(deserialized ? SERVICE(u)->deserialized_state : SERVICE(u)->state,
                     SERVICE_RUNNING,
+                    SERVICE_RUNNING_REVALIDATING,
                     SERVICE_REFRESH_EXTENSIONS,
                     SERVICE_REFRESH_CREDENTIALS,
                     SERVICE_RELOAD,
@@ -4297,9 +4323,9 @@ static int manager_run_environment_generators(Manager *m) {
         if (MANAGER_IS_TEST_RUN(m) && !(m->test_run_flags & MANAGER_TEST_RUN_ENV_GENERATORS))
                 return 0;
 
-        paths = env_generator_binary_paths(m->runtime_scope);
-        if (!paths)
-                return log_oom();
+        r = env_generator_binary_paths(m->runtime_scope, &paths);
+        if (r < 0)
+                return log_error_errno(r, "Failed to initialize environment generator search paths: %m");
 
         if (!generator_path_any(paths))
                 return 0;
@@ -4450,9 +4476,9 @@ static int manager_run_generators(Manager *m) {
         if (MANAGER_IS_TEST_RUN(m) && !(m->test_run_flags & MANAGER_TEST_RUN_GENERATORS))
                 return 0;
 
-        paths = generator_binary_paths(m->runtime_scope);
-        if (!paths)
-                return log_oom();
+        r = generator_binary_paths(m->runtime_scope, &paths);
+        if (r < 0)
+                return log_error_errno(r, "Failed to initialize generator search paths: %m");
 
         if (!generator_path_any(paths))
                 return 0;
