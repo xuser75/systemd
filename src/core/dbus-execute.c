@@ -1634,14 +1634,6 @@ int bus_property_get_exec_ex_command_list(
         return sd_bus_message_close_container(reply);
 }
 
-static char* exec_command_flags_to_exec_chars(ExecCommandFlags flags) {
-        return strjoin(FLAGS_SET(flags, EXEC_COMMAND_IGNORE_FAILURE)   ? "-" : "",
-                       FLAGS_SET(flags, EXEC_COMMAND_NO_ENV_EXPAND)    ? ":" : "",
-                       FLAGS_SET(flags, EXEC_COMMAND_FULLY_PRIVILEGED) ? "+" : "",
-                       FLAGS_SET(flags, EXEC_COMMAND_NO_SETUID)        ? "!" : "",
-                       FLAGS_SET(flags, EXEC_COMMAND_VIA_SHELL)        ? "|" : "");
-}
-
 int bus_set_transient_exec_command(
                 Unit *u,
                 const char *name,
@@ -1708,16 +1700,6 @@ int bus_set_transient_exec_command(
                         if (strv_isempty(argv))
                                 return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
                                                          "\"%s\" argv cannot be empty", name);
-                } else {
-                        /* Always normalize path and argv0 to be "sh" */
-                        path = _PATH_BSHELL;
-
-                        if (strv_isempty(argv))
-                                r = strv_extend(&argv, "sh");
-                        else
-                                r = free_and_strdup(&argv[0], argv[0][0] == '-' ? "-sh" : "sh");
-                        if (r < 0)
-                                return r;
                 }
 
                 r = sd_bus_message_exit_container(message);
@@ -1727,16 +1709,7 @@ int bus_set_transient_exec_command(
                 if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
                         _cleanup_(exec_command_freep) ExecCommand *c = NULL;
 
-                        c = new(ExecCommand, 1);
-                        if (!c)
-                                return -ENOMEM;
-
-                        *c = (ExecCommand) {
-                                .argv = TAKE_PTR(argv),
-                                .flags = command_flags,
-                        };
-
-                        r = path_simplify_alloc(path, &c->path);
+                        r = exec_command_new(path, TAKE_PTR(argv), command_flags, &c);
                         if (r < 0)
                                 return r;
 
@@ -1767,32 +1740,13 @@ int bus_set_transient_exec_command(
                 fprintf(f, "%s=\n", written_name);
 
                 LIST_FOREACH(command, c, *exec_command) {
-                        _cleanup_free_ char *a = NULL, *exec_chars = NULL;
-                        UnitWriteFlags esc_flags = UNIT_ESCAPE_SPECIFIERS |
-                                (FLAGS_SET(c->flags, EXEC_COMMAND_NO_ENV_EXPAND) ? UNIT_ESCAPE_EXEC_SYNTAX : UNIT_ESCAPE_EXEC_SYNTAX_ENV);
-                        bool via_shell = FLAGS_SET(c->flags, EXEC_COMMAND_VIA_SHELL);
+                        _cleanup_free_ char *a = NULL;
 
-                        exec_chars = exec_command_flags_to_exec_chars(c->flags);
-                        if (!exec_chars)
-                                return -ENOMEM;
+                        r = exec_command_to_setting(c, &a);
+                        if (r < 0)
+                                return r;
 
-                        a = unit_concat_strv(via_shell ? strv_skip(c->argv, 1) : c->argv, esc_flags);
-                        if (!a)
-                                return -ENOMEM;
-
-                        if (via_shell || streq(c->path, c->argv[0]))
-                                fprintf(f, "%s=%s%s%s\n",
-                                        written_name, exec_chars, via_shell && c->argv[0][0] == '-' ? "@" : "", a);
-                        else {
-                                _cleanup_free_ char *t = NULL;
-                                const char *p;
-
-                                p = unit_escape_setting(c->path, esc_flags, &t);
-                                if (!p)
-                                        return -ENOMEM;
-
-                                fprintf(f, "%s=%s@%s %s\n", written_name, exec_chars, p, a);
-                        }
+                        fprintf(f, "%s=%s\n", written_name, a);
                 }
 
                 r = memstream_finalize(&m, &buf, NULL);
@@ -3012,6 +2966,19 @@ int bus_exec_context_set_transient_property(
                 if (r < 0)
                         return r;
 
+                /* The names may be specified without the AF_ prefix and in any case. Validate them all before
+                 * applying anything, and use the canonical form from here on, in particular in the drop-in. */
+                STRV_FOREACH(s, l) {
+                        int af = af_from_name(*s);
+                        if (af < 0)
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                                         "Invalid address family: %s", *s);
+
+                        r = free_and_strdup(s, af_to_name(af));
+                        if (r < 0)
+                                return r;
+                }
+
                 if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
                         _cleanup_free_ char *joined = NULL;
 
@@ -3033,11 +3000,8 @@ int bus_exec_context_set_transient_property(
                         }
 
                         STRV_FOREACH(s, l) {
-                                int af;
-
-                                af = af_from_name(*s);
-                                if (af < 0)
-                                        return af;
+                                int af = af_from_name(*s);
+                                assert(af >= 0);
 
                                 if (allow_list == c->address_families_allow_list) {
                                         r = set_put(c->address_families, INT_TO_PTR(af));

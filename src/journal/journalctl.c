@@ -991,11 +991,10 @@ static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         if (!arg_follow)
                 arg_journal_additional_open_flags = SD_JOURNAL_ASSUME_IMMUTABLE;
 
-        args = strv_copy(args);
-        if (!args)
+        r = strv_copy_unless_empty(args, remaining_args);
+        if (r < 0)
                 return log_oom();
 
-        *remaining_args = args;
         return 1;
 }
 
@@ -1013,6 +1012,7 @@ static int run(int argc, char *argv[]) {
         LIBMOUNT_NOTE(recommended);
         LIBPCRE2_NOTE(suggested);
         LIBQRENCODE_NOTE(suggested);
+        TPM2_NOTE(suggested);
 
         setlocale(LC_ALL, "");
         log_setup();

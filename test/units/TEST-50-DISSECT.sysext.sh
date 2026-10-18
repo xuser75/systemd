@@ -11,7 +11,7 @@ FSTYPE=$(stat --file-system --format "%T" /usr)
 
 shopt -s nullglob
 
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 at_exit() {
     set +ex
 
@@ -97,20 +97,15 @@ prepare_root() {
     prepend_trap "cleanup_os_release ${root@Q}"
 }
 
+# shellcheck disable=SC2317,SC2329
 cleanup_os_release() {
-    # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
     local root=${1:-}
 
-    # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
     rm -f "$root/usr/lib/os-release"
-    # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
     if [[ -e $root/usr/lib/os-release.orig ]]; then
-        # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
         mv "$root/usr/lib/os-release.orig" "$root/usr/lib/os-release"
     fi
-    # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
     if [[ -e $root/etc/os-release.orig ]]; then
-        # shellcheck disable=SC2317 # It is not unreachable, used in a trap couple lines above.
         mv "$root/etc/os-release.orig" "$root/etc/os-release"
     fi
 }
@@ -363,6 +358,25 @@ extension_verify_mount_option() (
     done
 )
 
+extension_verify_status_json() (
+    local root=${1:-}
+    local hierarchy=${2:?}
+    local expected_extensions=${3:?}
+    local status_json since_filter
+
+    # Whether a hierarchy is merged is told by "since", not by "extensions": an empty array is also
+    # reported for a hierarchy merged in mutable mode without any extensions.
+    if [[ "$expected_extensions" == "[]" ]]; then
+        since_filter='.since == null'
+    else
+        since_filter='.since != null'
+    fi
+
+    status_json=$(run_systemd_sysext "$root" status --json=pretty)
+    jq -e --arg h "$hierarchy" --argjson e "$expected_extensions" \
+       "any(.[]; .hierarchy == \$h and .extensions == \$e and $since_filter)" >/dev/null <<<"$status_json"
+)
+
 run_systemd_sysext() {
     local root=${1:-}
     shift
@@ -400,9 +414,11 @@ prepare_read_only_hierarchy "$fake_root" "$hierarchy"
 run_systemd_sysext "$fake_root" merge
 (! touch "$fake_root$hierarchy/should-still-fail-on-read-only-fs")
 extension_verify_after_merge "$fake_root" "$hierarchy" -e -h
+extension_verify_status_json "$fake_root" "$hierarchy" '["test-extension"]'
 
 run_systemd_sysext "$fake_root" unmerge
 extension_verify_after_unmerge "$fake_root" "$hierarchy" -h
+extension_verify_status_json "$fake_root" "$hierarchy" '[]'
 (! touch "$fake_root$hierarchy/should-still-fail-on-read-only-fs")
 )
 
@@ -1270,7 +1286,7 @@ prepare_read_only_hierarchy "$fake_root" "$hierarchy"
 
 # Should be a no-op, thus we also don't run unmerge afterwards (otherwise the test is broken)
 run_systemd_sysext "$fake_root" merge
-if run_systemd_sysext "$fake_root" status --json=pretty |  jq -r '.[].extensions' | grep -v '^none$' ; then
+if ! extension_verify_status_json "$fake_root" "$hierarchy" '[]'; then
     echo >&2 "Extension got loaded for an initrd structure passed as --root= while the extension does not declare itself compatible with the initrd scope"
     exit 1
 fi

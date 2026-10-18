@@ -1687,7 +1687,7 @@ static int get_pool_directory(
         return 0;
 }
 
-static int unprivileged_clone(Image *i, const char *new_path) {
+static int unprivileged_clone(Image *i, const char *new_path, bool read_only) {
         int r;
 
         assert(i);
@@ -1718,14 +1718,9 @@ static int unprivileged_clone(Image *i, const char *new_path) {
 
         /* Make new image */
         _cleanup_close_ int new_fd = -EBADF;
-        r = mountfsd_make_directory(
-                        link,
-                        new_path,
-                        MODE_INVALID,
-                        /* flags= */ 0,
-                        &new_fd);
+        r = mkdir_foreign(new_path, MODE_INVALID, &new_fd);
         if (r < 0)
-                return 0;
+                return r;
 
         /* Mount new image */
         _cleanup_close_ int target_fd = -EBADF;
@@ -1741,7 +1736,15 @@ static int unprivileged_clone(Image *i, const char *new_path) {
         link = sd_varlink_unref(link);
 
         /* Fork off child that moves into userns and does the copying */
-        return copy_tree_at_foreign(tree_fd, target_fd, userns_fd);
+        r = copy_tree_at_foreign(tree_fd, target_fd, userns_fd);
+        if (r < 0)
+                return r;
+
+        /* Match the best-effort immutable bit handling of ordinary directory clones. */
+        if (read_only)
+                (void) chattr_fd(new_fd, FS_IMMUTABLE_FL, FS_IMMUTABLE_FL);
+
+        return 0;
 }
 
 int image_clone(Image *i, const char *new_name, bool read_only, RuntimeScope scope) {
@@ -1784,7 +1787,7 @@ int image_clone(Image *i, const char *new_name, bool read_only, RuntimeScope sco
                         return r;
 
                 if (i->foreign_uid_owned)
-                        r = unprivileged_clone(i, new_path);
+                        r = unprivileged_clone(i, new_path, read_only);
                 else {
                         r = btrfs_subvol_snapshot_at(
                                         AT_FDCWD, i->path,
@@ -2220,7 +2223,7 @@ int image_setup_pool(RuntimeScope scope, ImageClass class, bool use_btrfs_subvol
         return 0;
 }
 
-int image_read_metadata(Image *i, const char *root, const ImagePolicy *image_policy, RuntimeScope scope) {
+int image_read_metadata(Image *i, const char *root, const ImagePolicy *image_policy, RuntimeScope scope, DissectImageFlags extra_flags) {
         _cleanup_(release_lock_file) LockFile global_lock = LOCK_FILE_INIT, local_lock = LOCK_FILE_INIT;
         int r;
 
@@ -2308,7 +2311,8 @@ int image_read_metadata(Image *i, const char *root, const ImagePolicy *image_pol
                         DISSECT_IMAGE_PIN_PARTITION_DEVICES |
                         DISSECT_IMAGE_VALIDATE_OS |
                         DISSECT_IMAGE_VALIDATE_OS_EXT |
-                        DISSECT_IMAGE_ALLOW_USERSPACE_VERITY;
+                        DISSECT_IMAGE_ALLOW_USERSPACE_VERITY |
+                        extra_flags;
 
                 r = loop_device_make_by_path(
                                 i->path,

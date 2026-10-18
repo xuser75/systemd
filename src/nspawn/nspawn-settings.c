@@ -95,7 +95,9 @@ int settings_load(FILE *f, const char *path, Settings **ret) {
         /* Make sure that if userns_mode is set, userns_chown is set to something appropriate, and vice versa. Either
          * both fields shall be initialized or neither. */
         if (s->userns_mode >= 0 && s->userns_ownership < 0)
-                s->userns_ownership = s->userns_mode == USER_NAMESPACE_PICK ? USER_NAMESPACE_OWNERSHIP_CHOWN : USER_NAMESPACE_OWNERSHIP_OFF;
+                s->userns_ownership = IN_SET(s->userns_mode, USER_NAMESPACE_PICK, USER_NAMESPACE_MANAGED)
+                        ? USER_NAMESPACE_OWNERSHIP_AUTO
+                        : USER_NAMESPACE_OWNERSHIP_OFF;
         if (s->userns_ownership >= 0 && s->userns_mode < 0)
                 s->userns_mode = USER_NAMESPACE_NO;
 
@@ -755,21 +757,19 @@ int config_parse_syscall_filter(
                 void *userdata) {
 
         Settings *settings = data;
-        bool negative;
-        const char *items;
         int r;
 
         assert(filename);
         assert(lvalue);
         assert(rvalue);
 
-        negative = rvalue[0] == '~';
-        items = negative ? rvalue + 1 : rvalue;
+        bool negative = rvalue[0] == '~';
+        const char *items = negative ? rvalue + 1 : rvalue;
 
         for (;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&items, &word, NULL, 0);
+                r = extract_first_word(&items, &word, /* separators= */ WHITESPACE ",", 0);
                 if (r == 0)
                         return 0;
                 if (r == -ENOMEM)

@@ -8,6 +8,7 @@ typedef struct ExtraDrive {
         char *path;
         ImageFormat format;
         DiskType disk_type;
+        bool read_only;
 } ExtraDrive;
 
 typedef struct ExtraDriveContext {
@@ -44,8 +45,8 @@ typedef enum Firmware {
 
 typedef enum ConfidentialComputing {
         COCO_NO,
-        COCO_AMD_SEV_SNP,
-        COCO_INTEL_TDX,
+        COCO_SEV_SNP,
+        COCO_TDX,
         _COCO_MAX,
         _COCO_INVALID = -EINVAL,
 } ConfidentialComputing;

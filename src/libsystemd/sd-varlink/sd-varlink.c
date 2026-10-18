@@ -824,22 +824,30 @@ static int varlink_dispatch_disconnect(sd_varlink *v) {
         return 1;
 }
 
-static int varlink_sanitize_incoming_parameters(sd_json_variant **v) {
+static int varlink_normalize_incoming_parameters(sd_json_variant **framing, sd_json_variant **params) {
         int r;
-        assert(v);
 
-        /* Convert NULL or JSON null to empty object for method handlers (backward compatibility) */
-        if (!*v || sd_json_variant_is_null(*v)) {
+        /* UAPI.20 specifies that receivers of Varlink messages MUST treat "parameters" identically no matter
+         * if it is missing, explicitly null, or an empty object. Here, we choose to normalize "parameters"
+         * to an empty object if it is missing or null, which makes sd_varlink behave predictably (i.e.
+         * sd_varlink_call and similar never return write NULL to ret_parameters if they return r >= 0) */
+
+        assert(params);
+
+        if (!*params || sd_json_variant_is_null(*params)) {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *empty = NULL;
                 r = sd_json_variant_new_object(&empty, NULL, 0);
                 if (r < 0)
                         return r;
-                return json_variant_unref_and_replace(*v, empty);
-        }
 
-        /* Ensure we have an object */
-        if (!sd_json_variant_is_object(*v))
-                return -EINVAL;
+                if (framing) {
+                        r = sd_json_variant_set_field(framing, "parameters", empty);
+                        if (r < 0)
+                                return r;
+                }
+
+                return json_variant_unref_and_replace(*params, empty);
+        }
 
         return 0;
 }
@@ -903,7 +911,7 @@ static int varlink_dispatch_reply(sd_varlink *v) {
         if (error && FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES))
                 goto invalid;
 
-        r = varlink_sanitize_incoming_parameters(&parameters);
+        r = varlink_normalize_incoming_parameters(&v->current, &parameters);
         if (r < 0)
                 goto invalid;
 
@@ -1164,8 +1172,12 @@ static int varlink_dispatch_fiber(sd_varlink *v, const char *method, sd_varlink_
                 .callback = callback,
         };
 
-        _cleanup_(sd_future_unrefp) sd_future *f = NULL;
-        r = sd_fiber_new(v->server->event, method, varlink_fiber_entry, d, varlink_fiber_data_destroy, &f);
+        _cleanup_(sd_future_cancel_unrefp) sd_future *f = NULL;
+        r = sd_fiber_new(v->server->event, method, varlink_fiber_entry, d, &f);
+        if (r < 0)
+                return r;
+
+        r = sd_fiber_set_destroy_callback(f, varlink_fiber_data_destroy);
         if (r < 0)
                 return r;
 
@@ -1189,6 +1201,8 @@ static int varlink_dispatch_fiber(sd_varlink *v, const char *method, sd_varlink_
         if (r < 0)
                 return r;
 
+        /* Floating self-ref keeps the fiber alive; release our local ref without cancelling. */
+        f = sd_future_unref(f);
         return 0;
 }
 
@@ -1269,7 +1283,7 @@ static int varlink_dispatch_method(sd_varlink *v) {
         if (!method)
                 goto invalid;
 
-        r = varlink_sanitize_incoming_parameters(&parameters);
+        r = varlink_normalize_incoming_parameters(NULL, &parameters);
         if (r < 0)
                 goto fail;
 
@@ -2354,15 +2368,6 @@ _public_ int sd_varlink_collect_full(
 
                         if (sd_json_variant_elements(collected) >= VARLINK_COLLECT_MAX)
                                 return varlink_log_errno(v, SYNTHETIC_ERRNO(E2BIG), "Number of reply messages grew too large (%zu) while collecting.", sd_json_variant_elements(collected));
-
-                        _cleanup_(sd_json_variant_unrefp) sd_json_variant *empty = NULL;
-                        if (!p) {
-                                r = sd_json_variant_new_array(&empty, /* array= */ NULL, /* n= */ 0);
-                                if (r < 0)
-                                        return r;
-
-                                p = empty;
-                        }
 
                         r = sd_json_variant_append_array(&collected, p);
                         if (r < 0)
@@ -3748,8 +3753,8 @@ _public_ int sd_varlink_server_listen_name(sd_varlink_server *s, const char *nam
         /* Adds all passed fds marked as "name" to our varlink server. These fds can either refer to a
          * listening socket or to a connection socket.
          *
-         * See https://varlink.org/#activation for the environment variables this is backed by and the
-         * recommended "varlink" identifier in $LISTEN_FDNAMES. */
+         * See https://uapi-group.org/specifications/specs/varlink/#socket-activation for the environment
+         * variables this is backed by and the recommended "varlink" identifier in $LISTEN_FDNAMES. */
 
         m = sd_listen_fds_with_names(/* unset_environment= */ false, &names);
         if (m < 0)
@@ -4269,16 +4274,17 @@ _public_ int sd_varlink_error_to_errno(const char *error, sd_json_variant *param
                 const char *error;
                 int value;
         } table[] = {
-                { SD_VARLINK_ERROR_DISCONNECTED,           -ECONNRESET    },
-                { SD_VARLINK_ERROR_TIMEOUT,                -ETIMEDOUT     },
-                { SD_VARLINK_ERROR_PROTOCOL,               -EPROTO        },
-                { SD_VARLINK_ERROR_INTERFACE_NOT_FOUND,    -EADDRNOTAVAIL },
-                { SD_VARLINK_ERROR_METHOD_NOT_FOUND,       -ENXIO         },
-                { SD_VARLINK_ERROR_METHOD_NOT_IMPLEMENTED, -ENOTTY        },
-                { SD_VARLINK_ERROR_INVALID_PARAMETER,      -EINVAL        },
-                { SD_VARLINK_ERROR_PERMISSION_DENIED,      -EACCES        },
-                { SD_VARLINK_ERROR_EXPECTED_MORE,          -EBADE         },
-                { SD_VARLINK_ERROR_EXPECTED_UPGRADE,       -EPROTOTYPE    },
+                { SD_VARLINK_ERROR_DISCONNECTED,            -ECONNRESET    },
+                { SD_VARLINK_ERROR_TIMEOUT,                 -ETIMEDOUT     },
+                { SD_VARLINK_ERROR_PROTOCOL,                -EPROTO        },
+                { SD_VARLINK_ERROR_OPERATION_NOT_SUPPORTED, -EOPNOTSUPP    },
+                { SD_VARLINK_ERROR_INTERFACE_NOT_FOUND,     -EADDRNOTAVAIL },
+                { SD_VARLINK_ERROR_METHOD_NOT_FOUND,        -ENXIO         },
+                { SD_VARLINK_ERROR_METHOD_NOT_IMPLEMENTED,  -ENOTTY        },
+                { SD_VARLINK_ERROR_INVALID_PARAMETER,       -EINVAL        },
+                { SD_VARLINK_ERROR_PERMISSION_DENIED,       -EACCES        },
+                { SD_VARLINK_ERROR_EXPECTED_MORE,           -EBADE         },
+                { SD_VARLINK_ERROR_EXPECTED_UPGRADE,        -EPROTOTYPE    },
         };
 
         int r;
